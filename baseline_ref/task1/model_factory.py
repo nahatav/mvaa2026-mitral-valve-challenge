@@ -56,6 +56,19 @@ def get_model(
             model = replace_segresnet_head(model, out_channels)
         return model
 
+    if name in {"stunet", "stunet_pretrained"}:
+        from stunet_arch import STUNet
+
+        model = STUNet(
+            input_channels=in_channels,
+            num_classes=105 if pretrained_ckpt else out_channels,
+            deep_supervision=False,
+        )
+        if pretrained_ckpt:
+            load_pretrained_stunet_backbone(model, pretrained_ckpt)
+            model = replace_stunet_head(model, out_channels)
+        return model
+
     if channels is None or num_res_units is None:
         if model_size == "small":
             channels = (16, 32, 64, 128, 256)
@@ -113,6 +126,32 @@ def replace_segresnet_head(model: SegResNet, out_channels: int) -> SegResNet:
         bias=old_head.bias is not None,
     )
     model.conv_final[2].conv = new_head
+    return model
+
+
+def load_pretrained_stunet_backbone(model, ckpt_path: str | Path) -> None:
+    """Load uni-medical/STU-Net-B pretrained weights (TotalSegmentator,
+    105 classes) into a fresh STUNet instance. Checkpoint is nnU-Net v1
+    format ({'state_dict': ...}); all 130 keys must match exactly since
+    this is our own from-source reimplementation of their architecture -
+    see stunet_arch.py."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+    missing, unexpected = model.load_state_dict(state, strict=True)
+    logger.info("Loaded pretrained STU-Net backbone from %s", ckpt_path)
+
+
+def replace_stunet_head(model, out_channels: int):
+    """Swap every deep-supervision seg_outputs head for a new class count
+    (only seg_outputs[-1] is actually used since deep_supervision=False,
+    but keep all in sync in case that's toggled later)."""
+    import torch.nn as nn
+
+    new_heads = nn.ModuleList()
+    for old_head in model.seg_outputs:
+        new_heads.append(nn.Conv3d(old_head.in_channels, out_channels, kernel_size=1))
+    model.seg_outputs = new_heads
+    model.num_classes = out_channels
     return model
 
 
