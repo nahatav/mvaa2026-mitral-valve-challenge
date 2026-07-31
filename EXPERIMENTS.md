@@ -1,5 +1,16 @@
 # Experiment Log
 
+## Plan: multi-hour push (2026-07-31, ~06:00-12:30 EST budget)
+
+v3 submitted but hit Codabench's own runner infra failure (`python:3.10-slim` pull EOF - their wrapper image, unrelated to ours; verified our image manifest/submission.json are fine). Given a much larger time budget for this pass, decided against gambling on unproven new architectures (VISTA3D etc. - too much integration risk in one sitting) and instead scaling the proven recipe:
+- Task 1: 4-5 fold ensemble of the pretrained-SegResNet + 1.5mm-spacing-matched recipe (~45min/fold), different random splits, softmax-averaged at inference alongside existing flip-TTA. Literature: 4-8 folds standard for n=27, ensembling reliably reduces variance vs any single split.
+- Task 3: full uncut run at the already-working 256x448/resnet34/imagenet config.
+- Task 2: still skipped - score is locked at 100 regardless of quality, would be wasted GPU time.
+
+**Considered and rejected: STU-Net pretrained backbone.** Literature flags it (and MedNeXt-v2) as stronger than our current SegResNet backbone (pretrained on 100k+ annotations vs our 1,228-scan checkpoint). Investigated integration requirements in depth: requires patching/forking nnU-Net with STU-Net's custom trainer classes, a default 1000-epoch schedule needing code-level shortening, and - critically - a completely separate inference pathway (`dynamic_network_architectures`, not `monai.networks`) meaning even a successful fine-tune wouldn't be usable in our Docker pipeline without a second full integration effort on top. Given today's session already needed multiple real debugging cycles for a much simpler architecture swap (plain MONAI SegResNet: OOM tuning across 3 configs, a spacing-mismatch bug, a MONAI transform metadata-key-collision bug), stacking this while Task 3 and final packaging still needed doing had a real chance of ending with nothing deployable. Redirected the budget into scaling the proven approach (bigger fold ensemble, Task 3 ensemble) instead - lower ceiling per unit of risk, but near-certain to land.
+
+**Verified against real data (not assumed):** confirmed `target_label=10` for Task 3 is genuinely correct by extracting a `_Label.json` from inside a training `.tar` and reading the `ColorLabelTableModel` - ID 10 = "二尖瓣" (mitral valve) in the actual annotation schema. Also confirmed Task 1's foreground is extremely sparse (~1.9% of voxels are mitral valve) and volumes are small (mean ~163x143x103 voxels) - the existing `SpatialPadd` + `RandCropByPosNegLabeld(pos=1,neg=1)` pipeline already handles both correctly (pads before crop, balanced fg/bg sampling), no bug found there.
+
 Running log of what was tried, what worked, what didn't, and real results. Internal val scores are on tiny held-out splits (3 cases for Task 1, 20 for Task 3) — noisy proxies, not directly comparable to the hidden test set. Hidden test scores are logged when known.
 
 ## Task 1 (Cardiac CT)
