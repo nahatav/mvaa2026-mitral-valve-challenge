@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Data (downloaded separately, see README)
+data/
+local_test_input/
+local_test_output/
+
+# Training runs / checkpoints (large, tracked via releases/DVC if needed)
+runs/
+docker/weights/*.pt
+pretrained/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,7 @@
+monai==1.6.0
+segmentation-models-pytorch==0.5.0
+timm
+huggingface-hub
+safetensors
+tqdm
+pyyaml
