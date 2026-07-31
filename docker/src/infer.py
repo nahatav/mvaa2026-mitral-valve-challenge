@@ -140,7 +140,7 @@ def run_task1(input_root: Path, output_root: Path) -> None:
         EnsureTyped(keys=["image"]),
     ]
     transforms = Compose(transform_list)
-    ds = Dataset([{**f, "image": f["image_path"]} for f in files], transform=transforms)
+    ds = Dataset([{"image": f["image_path"], "case_id": f["case_id"]} for f in files], transform=transforms)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     device = get_device()
@@ -214,7 +214,7 @@ def run_task2(input_root: Path, output_root: Path) -> None:
         ScaleIntensityRanged(keys=["image"], a_min=0.0, a_max=255.0, b_min=0.0, b_max=1.0, clip=True),
         EnsureTyped(keys=["image"]),
     ])
-    ds = Dataset([{**f, "image": f["image_path"]} for f in files], transform=transforms)
+    ds = Dataset([{"image": f["image_path"], "case_id": f["case_id"]} for f in files], transform=transforms)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
     device = get_device()
