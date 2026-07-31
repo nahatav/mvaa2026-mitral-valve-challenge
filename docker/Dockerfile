@@ -16,7 +16,7 @@ WORKDIR /workspace
 # non-torch sub-dependencies (huggingface-hub, safetensors, etc.) are safe to
 # resolve normally since none of them depend on torch.
 RUN pip install --no-cache-dir --no-deps monai==1.6.0 segmentation-models-pytorch==0.5.0 timm \
- && pip install --no-cache-dir huggingface-hub safetensors tqdm pyyaml numpy nibabel pillow \
+ && pip install --no-cache-dir huggingface-hub safetensors tqdm pyyaml numpy scipy nibabel pillow \
  && python -c "import torch; assert torch.__version__.startswith('2.5.1'), torch.__version__; print('torch OK', torch.__version__)" \
  && python -c "import segmentation_models_pytorch, monai, timm; print('imports OK')"
 

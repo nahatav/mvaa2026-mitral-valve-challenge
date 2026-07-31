@@ -253,6 +253,28 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def drop_small_components(mask: np.ndarray, min_area_px: int = 50, min_rel_area: float = 0.05) -> np.ndarray:
+    """Discard connected components far smaller than the main predicted
+    region. HD/ASD are max/mean *surface distance* metrics — a single stray
+    false-positive pixel or tiny blob far from the true mask can blow up
+    both scores even when overlap (DSC) looks fine. Keeps a component if
+    it's at least min_area_px pixels AND at least min_rel_area of the
+    largest component's area (so legitimate secondary regions survive)."""
+    from scipy import ndimage
+
+    if mask.sum() == 0:
+        return mask
+    labeled, n = ndimage.label(mask, structure=np.ones((3, 3)))
+    if n <= 1:
+        return mask
+    sizes = ndimage.sum(mask, labeled, index=np.arange(1, n + 1))
+    largest = sizes.max()
+    keep_labels = [i + 1 for i, s in enumerate(sizes) if s >= min_area_px and s >= min_rel_area * largest]
+    if not keep_labels:
+        keep_labels = [int(np.argmax(sizes)) + 1]
+    return np.isin(labeled, keep_labels).astype(mask.dtype)
+
+
 def run_task3(input_root: Path, output_root: Path) -> None:
     from PIL import Image
     from task3_model import get_model
@@ -316,6 +338,7 @@ def run_task3(input_root: Path, output_root: Path) -> None:
             pred_small = (probs > threshold).float()
             pred_orig = F.interpolate(pred_small, size=(h, w), mode="nearest")
             pred_mask = (pred_orig[0, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+            pred_mask = drop_small_components(pred_mask)
 
             save_path = out_dir / rel.parent / f"{image_path.stem}_label_bin.png"
             save_path.parent.mkdir(parents=True, exist_ok=True)
