@@ -106,7 +106,7 @@ def run_task1(input_root: Path, output_root: Path) -> None:
     from monai.data import DataLoader, Dataset
     from monai.inferers import SlidingWindowInferer
     from monai.transforms import (
-        Compose, EnsureChannelFirstd, EnsureTyped, LoadImaged, ScaleIntensityRanged,
+        Compose, EnsureChannelFirstd, EnsureTyped, LoadImaged, ScaleIntensityRanged, Spacingd,
     )
     from task1_model import get_model
 
@@ -121,18 +121,25 @@ def run_task1(input_root: Path, output_root: Path) -> None:
     model_size = str(train_args.get("model_size", "large"))
     roi_size = tuple(train_args.get("roi_size", [128, 128, 128]))
     sw_batch_size = int(train_args.get("sw_batch_size", 4))
+    enable_spacing_resample = bool(train_args.get("enable_spacing_resample", False))
+    target_spacing = tuple(train_args.get("target_spacing", [0.5, 0.5, 0.5]))
 
     files = discover_task1_images(input_root)
     log(f"task1: found {len(files)} images under {input_root}, model={model_name}")
     if not files:
         raise RuntimeError("task1: no input images discovered")
 
-    transforms = Compose([
+    transform_list = [
         LoadImaged(keys=["image"]),
         EnsureChannelFirstd(keys=["image"]),
+    ]
+    if enable_spacing_resample:
+        transform_list.append(Spacingd(keys=["image"], pixdim=target_spacing, mode="bilinear"))
+    transform_list += [
         ScaleIntensityRanged(keys=["image"], a_min=-1000.0, a_max=1000.0, b_min=0.0, b_max=1.0, clip=True),
         EnsureTyped(keys=["image"]),
-    ])
+    ]
+    transforms = Compose(transform_list)
     ds = Dataset([{**f, "image": f["image_path"]} for f in files], transform=transforms)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
