@@ -33,6 +33,30 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def drop_small_components_3d(mask: np.ndarray, min_vox: int = 20, min_rel_vox: float = 0.05) -> np.ndarray:
+    """3D analogue of the Task 3 connected-component filter, for cleaning up
+    spurious far-away voxel islands in Task 1's CT predictions before
+    computing HD/ASD (which are extremely sensitive to a single outlier
+    voxel). Every Task 1 case genuinely contains valve anatomy (verified
+    against real label data - min foreground fraction 1.19% across all 27
+    labeled cases), so unlike Task 3 there's no legitimate "should be
+    empty" case here - if nothing clears the bar, keep the single largest
+    component rather than returning empty."""
+    from scipy import ndimage
+
+    if mask.sum() == 0:
+        return mask
+    labeled, n = ndimage.label(mask, structure=np.ones((3, 3, 3)))
+    if n <= 1:
+        return mask
+    sizes = ndimage.sum(mask, labeled, index=np.arange(1, n + 1))
+    largest = sizes.max()
+    keep_labels = [i + 1 for i, s in enumerate(sizes) if s >= min_vox and s >= min_rel_vox * largest]
+    if not keep_labels:
+        keep_labels = [int(np.argmax(sizes)) + 1]
+    return np.isin(labeled, keep_labels).astype(mask.dtype)
+
+
 def sliding_window_tta(images: torch.Tensor, model, inferer, num_classes: int) -> torch.Tensor:
     """Mirror-flip TTA for 3D sliding-window inference: average softmax probs
     over identity + single-axis flips (spatial dims 2,3,4), matching the
@@ -186,6 +210,7 @@ def run_task1(input_root: Path, output_root: Path) -> None:
                 probs_sum = probs if probs_sum is None else probs_sum + probs
             probs = probs_sum / len(models_cfgs)
             pred_mask = torch.argmax(probs, dim=1).squeeze(0).detach().cpu().numpy()
+            pred_mask = drop_small_components_3d((pred_mask > 0).astype(np.uint8))
 
             case_id = str(batch["case_id"][0])
             image_path = Path(files[idx - 1]["image_path"])
@@ -302,8 +327,13 @@ def drop_small_components(mask: np.ndarray, min_area_px: int = 50, min_rel_area:
     sizes = ndimage.sum(mask, labeled, index=np.arange(1, n + 1))
     largest = sizes.max()
     keep_labels = [i + 1 for i, s in enumerate(sizes) if s >= min_area_px and s >= min_rel_area * largest]
+    # If nothing clears the bar, the correct answer is an empty mask - not
+    # force-keeping the largest scrap. Previously this always kept the
+    # largest component regardless, which meant a frame with only noise-
+    # sized blobs (the model's honest "no valve here" signal) still emitted
+    # a spurious prediction.
     if not keep_labels:
-        keep_labels = [int(np.argmax(sizes)) + 1]
+        return np.zeros_like(mask)
     return np.isin(labeled, keep_labels).astype(mask.dtype)
 
 

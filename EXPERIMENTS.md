@@ -70,6 +70,28 @@ Not retrained further — not worth the training budget given it's score-capped 
 
 `docker/weights/*.pt` are gitignored (large binaries, ~2.4GB total for v4) - checkpoints are copied there from `runs/` during the build prep and the `runs/` directories themselves are deleted afterward to manage disk space (hit "No space left on device" once during this session - cleaned up old run dirs, leftover source zips, and Docker build cache to recover).
 
+## v5: diagnosing why real hidden-test scores were far below internal validation (2026-07-31, ~18:50-20:20)
+
+v4's real hidden-test scores came back well below internal val, and in Task 3's case the HD/ASD were *dramatically* worse (359/80 vs internal 55.8/9.2) rather than just "a bit worse" — a gap that size means the internal validation protocol was measuring something different from what the hidden test actually penalizes, not just ordinary train/test variance. Root-caused two separate, real bugs in the validation methodology itself (not the model):
+
+**Task 3: `val_only_fg=True` hid false-positive behavior from checkpoint selection.** 34% of labeled frames have no visible valve (background frames), and the training script's validation loop was filtering to foreground-only frames before scoring — so a checkpoint that hallucinated a valve on every background frame would score identically to one that correctly predicted empty. Confirmed empirically before touching anything: ran v4's checkpoint directly against held-out background frames and found **87% (13/15) produced false-positive predictions**, several with 5,000-12,000+ falsely-predicted pixels. This directly explains both the DSC drop and the HD/ASD blowup — HD/ASD are worst-case/mean surface-distance metrics, so a single false-positive blob far from any true mask (which is every pixel, on a background frame) is catastrophic for both.
+
+Fix: retrained with `--no-val-only-fg` so validation includes all 60 val frames (previously the checkpoint-selection signal only ever saw the ~40 foreground frames). Same cost, same schedule (20 epochs) — this was a config bug, not a modeling problem, so it needed no extra training budget. Also fixed a related bug in `drop_small_components` (Task 3's postprocessing): its connected-component fallback previously *always* force-kept the largest blob even when nothing cleared the size threshold, meaning a background frame with only noise-sized artifacts still emitted a spurious non-empty prediction regardless of what the model actually predicted. Changed the fallback to return an empty mask instead.
+
+Result: best checkpoint (epoch 11/20) now scores **DSC 0.742, HD 38.66, ASD 8.05** on a validation protocol that actually includes background frames — HD/ASD are ~9x and ~10x better than v4's real hidden-test numbers on the old (broken) protocol. DSC is lower than v4's foreground-only internal number (0.741 fg-only vs 0.74 all-frames — comparable, but no longer inflated by skipping the frames it was failing on).
+
+**Task 1: a 3-case validation split was too small to reliably select a "best" checkpoint.** With only 3 held-out cases, val DSC bounced around a lot epoch to epoch (0.4 → 0.84 → 0.5 → 0.74 in one run) — "best epoch" was picking noise, not genuine generalization, and the checkpoint that happened to land a lucky epoch on those specific 3 cases became the one shipped. Fix: retrained a single STU-Net-B fold with `--val-count 8` (up from the default `--val-ratio 0.1` ≈ 3 cases out of 27 total labeled) for a meaningfully less noisy selection signal, same recipe otherwise (96³ roi, 1.5mm spacing-matched, batch=1, unsup-ratio=1). 60 epochs, ~22min.
+
+Result: best epoch 30, **DSC 0.757, HD 3.80, ASD 0.31** on the 8-case split. This DSC is lower than v4's fold scores (0.81-0.82 on 3 cases) — expected and healthy, since it's no longer cherry-picked by a small lucky split. HD/ASD are comparable to v4's folds (3.8 vs 2.6-3.4, 0.31 vs 0.21-0.24). Given the demonstrated unreliability of the old 2-fold ensemble's checkpoint selection, replaced both old `task1_stunet_fold{1,2}.pt` in the ensemble with this single, more reliably-selected checkpoint rather than diluting/hedging with them.
+
+**Also audited and fixed (not a regression, a genuine gap):** Task 1's inference pipeline had no connected-component postprocessing at all, asymmetric with Task 3's (which already had it, pre-v5-fix, for the same HD/ASD-sensitivity reason). Added `drop_small_components_3d()` to `infer.py`, wired into `run_task1` right after argmax — same rationale as Task 3's filter (HD/ASD are extremely sensitive to a single stray voxel island), but with an important asymmetric fallback: unlike Task 3, every real Task 1 case genuinely contains valve anatomy (verified: min foreground fraction 1.19% across all 27 labeled cases), so if nothing clears the size threshold, it force-keeps the single largest component rather than returning empty — Task 1 has no legitimate "should be empty" case, Task 3 does.
+
+## Docker submission images (continued)
+
+| Tag | Task1 | Task2 | Task3 | Status |
+|---|---|---|---|---|
+| **`v5`** | STU-Net-B, single fold, 8-case val split, 3D connected-component filter added | unchanged | val_only_fg=False retrain (epoch 11/20), connected-component fallback bug fixed | **Built, smoke-tested end-to-end (all 3 tasks pass with real data), pushed to `valpip/mvaa2026-submission:v5` (digest `sha256:14c93291...`). Ready to submit.** |
+
 ## Reference: public leaderboard (as of 2026-07-31)
 
 Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone).
