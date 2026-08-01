@@ -230,6 +230,41 @@ Three consequences. (a) Region losses (Dice/CE) integrate over *volume*, so for 
 5. **Task 3 frame confidence gate**: verified to cut false positives 5/62 -> 1/62 at ~zero DSC cost.
 6. **Task 1 empty-prediction guard**: prevents the 1,000,000-per-case penalty that cost v6 two cases.
 
+## Second review pass (2026-08-01, ~04:00-04:45) - two findings that reframe both tasks
+
+### Task 1: the valve does not fit inside the training patch
+
+| | valve bounding box (mm) | our 96^3 patch covers |
+|---|---|---|
+| median | 36.6 x 29.1 x 37.5 | **34.6** x 34.6 x 49.0 |
+| max | **42.7** x 36.5 x 44.5 | |
+
+**In 78% of cases the valve is wider in x than the patch the network is trained on.** It has literally never seen the whole structure in one view. For a thin, spatially extended sheet this directly damages global shape coherence, which is what HD and ASD measure - and those are two thirds of the normalized task score. nnU-Net's documented rule is to *maximize patch size, preferring it over batch size*; we sat at 96^3 for the entire project without checking whether the target fits inside it. A 128x128x96 patch covers 46.1 x 46.1 x 49.0 mm and contains every valve in the dataset.
+
+Supporting fact: the valve sits at a very consistent relative position (centroid mean [0.528, 0.567, 0.490], std [0.022, 0.026, 0.013]), i.e. the volumes are effectively pre-registered around it, so a larger centered patch reliably contains the whole structure.
+
+Also confirmed: **Task 1 has no domain shift.** Its public val set matches training almost exactly (shape 163x144x104 vs 163x142x103, spacing 0.344 vs 0.357, near-identical HU percentiles). Task 1's gap is pure model capability, unlike Task 3.
+
+### Task 3: evidence of a brightness shortcut (Clever-Hans risk)
+
+Frames that contain the valve are systematically brighter than background frames:
+
+| feature | foreground frames | background frames | Cohen's d |
+|---|---|---|---|
+| mean Green | 0.3371 | 0.2746 | **+0.80 (large)** |
+| mean Red | 0.5548 | 0.4929 | +0.73 |
+| edge energy | 0.0172 | 0.0197 | -0.56 |
+
+A model can exploit "bright frame -> valve present" instead of learning valve appearance. Combined with the separately measured fact that **brightness differs 13-32% between videos**, this predicts exactly the failure we observe: on an unseen video with different lighting the shortcut misfires, producing false positives/negatives, which are penalised and inflate HD/ASD.
+
+That is consistent with the sharpest symptom in our results: our ASD/HD ratio is **0.203 internally** (indistinguishable from the top cluster's 0.211) but **0.647 on the real hidden test**. A high ratio means error spread over many boundary points plus penalty-valued frames - not a single stray blob.
+
+This gives the strong colour augmentation a concrete mechanism rather than a vague appeal to robustness: +/-30% per-channel gain **decorrelates brightness from valve presence**, forcing the network onto anatomy.
+
+### Pretraining review (the leg we had never revisited)
+
+We have used exactly one backbone all project (STU-Net-B, supervised-pretrained on TotalSegmentator-derived labels) and never evaluated alternatives. Reviewed [SuPreM](https://github.com/MrGiovanni/SuPreM) (ICLR 2024 oral, 9,262 CT volumes) and [VoCo](https://hkustsmartlab.github.io/2025/12/03/voco/) (self-supervised, 160K CT volumes). Two conclusions: supervised pretraining is reported as the preferred choice for transfer, so our backbone is already the right *class* of model - swapping is unlikely to be the win; and VoCo's documented strength is precisely "datasets with limited labeled cases", which is our regime, but a backbone swap mid-run is high integration risk for unproven gain. Recorded as a genuine option for a longer budget, not taken now.
+
 ## Reference: public leaderboard (as of 2026-07-31)
 
 Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone).
