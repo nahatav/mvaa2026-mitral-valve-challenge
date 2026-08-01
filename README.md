@@ -1,5 +1,7 @@
 # MVAA 2026 — Mitral Valve Anatomy Analysis Challenge
 
+> **Disclaimer:** This project was developed as a Proof of Concept (POC) during a limited time frame on a single RTX 4050 laptop GPU (6GB VRAM). It is not a full-scale exhaustive run.
+
 Submission pipeline for the [MVAA 2026 Challenge](https://mwm2026.github.io/mvaa) (MICCAI 2026 Medical World Model Workshop, hosted on [Codabench](https://www.codabench.org/competitions/17301)).
 
 Three segmentation tasks across three imaging modalities:
@@ -12,13 +14,17 @@ Three segmentation tasks across three imaging modalities:
 
 Final ranking uses only Task 1 and Task 3 — Task 2's score is fixed at 100 points for every eligible team since it uses a public dataset, so it only needs a valid submission, not a competitive one.
 
-## Approach
+## Approach (Final Submission v11)
 
-- **Task 1**: 3D SegResNet, initialized from [MONAI Model Zoo's `wholeBody_ct_segmentation`](https://github.com/Project-MONAI/model-zoo/tree/dev/models/wholeBody_ct_segmentation) pretrained backbone (TotalSegmentator, 104 structures) with the output head swapped for our 2-class problem, then fine-tuned with mean-teacher semi-supervised learning over the 1,040 unlabeled scans.
+**Highest Scores (Hidden Test):**
+- **Task 1:** DSC 0.811 | HD 6.86 mm | ASD 0.810 mm
+- **Task 3:** DSC 0.775 | HD 361 mm | ASD 233 mm
+
+- **Task 1**: STU-Net-B (58.26M params), supervised-pretrained on TotalSegmentator labels. Fine-tuned with mean-teacher semi-supervised learning over 1,040 unlabeled scans. Preprocessing fixes (native median spacing, nnU-Net normalization) and a compound Dice-CE-boundary loss are the key performance drivers.
 - **Task 2**: 3D UNet (MONAI), fully supervised.
-- **Task 3**: 2D UNet++ (`segmentation-models-pytorch`) with an ImageNet-pretrained ResNet34 encoder, mean-teacher semi-supervised learning over the unlabeled frame pool, TTA (flip) at inference.
+- **Task 3**: 2D UNet++ (`segmentation-models-pytorch`) with an ImageNet-pretrained ResNet34 encoder, mean-teacher semi-supervised learning. Inference includes multi-scale flip TTA and strong color/affine augmentations to counter cross-video brightness shifts.
 
-All three tasks share the mean-teacher / EMA-teacher semi-supervised training pattern from the organizers' own [baseline code](https://github.com/db0725/MVAA) (`baseline_ref/`), extended here with the pretrained backbone, tuned hyperparameters for a 6GB GPU, and a unified inference/Docker packaging layer.
+All three tasks share the mean-teacher / EMA-teacher semi-supervised training pattern from the organizers' own [baseline code](https://github.com/db0725/MVAA) (`baseline_ref/`), extended here with the pretrained backbone, boundary losses, and a unified inference/Docker packaging layer.
 
 ## Repo layout
 

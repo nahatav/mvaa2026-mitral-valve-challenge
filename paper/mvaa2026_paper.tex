@@ -1,0 +1,147 @@
+% MICCAI 2026 MVAA Challenge Paper
+\documentclass[runningheads]{llncs}
+
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{url}
+\usepackage{hyperref}
+
+\begin{document}
+
+\title{Spacing, Boundaries and Ensembles: A Diagnostic Approach to Mitral Valve Segmentation in CT and Surgical Video}
+\titlerunning{Spacing, Boundaries and Ensembles}
+
+\author{Anonymized Authors}
+\authorrunning{Anonymized Author et al.}
+\institute{Anonymized Affiliations \\
+    \email{email@anonymized.com}}
+
+\maketitle
+
+\begin{abstract}
+We present our solution to the MVAA 2026 challenge for mitral valve segmentation. Our final submission achieves a Task 1 (cardiac CT) hidden test score of DSC 0.811, HD 6.86 mm, and ASD 0.810 mm. For Task 3 (surgical video), we achieve DSC 0.775, HD 361 mm, and ASD 233 mm. We adopted a diagnostic methodology focused on identifying pipeline bottlenecks. We found that resampling target spacing imposes a hard ceiling on achievable accuracy for thin structures. A perfect prediction resampled to 1.5 mm and back scores only 0.864 DSC, whereas the mitral valve is a thin sheet (median maximum inscribed radius 1.82 mm). Correcting the spacing to the dataset median improved our real hidden-test DSC from 0.651 to 0.789. We also show that our Task 3 model exploited a brightness shortcut, which we mitigated using targeted augmentations.
+
+\keywords{mitral valve \and segmentation \and nnU-Net \and challenge.}
+\end{abstract}
+
+\section{Introduction and Final Scores}
+
+The MVAA 2026 challenge requires mitral valve segmentation across three modalities: cardiac CT (Task 1), 3D transesophageal echocardiography (Task 2, normalized to 100 for all teams), and surgical video (Task 3). This paper serves as our technical challenge report. We present our methodology, progression, and negative results.
+
+Our final submission (version 11) achieves the following hidden test scores:
+\begin{itemize}
+    \item \textbf{Task 1 (Cardiac CT):} DSC 0.811, HD 6.86 mm, ASD 0.810 mm.
+    \item \textbf{Task 3 (Surgical Video):} DSC 0.775, HD 361 mm, ASD 233 mm.
+\end{itemize}
+
+The official ranking uses normalized metric scores, meaning Hausdorff Distance (HD) and Average Surface Distance (ASD) together carry two-thirds of each task's weight. Our pipeline development therefore prioritized boundary precision alongside volumetric overlap.
+
+\section{Methodology}
+
+\subsection{Data Characterization and Preprocessing Limits}
+
+Before optimizing models, we analyzed the preprocessing pipeline's impact on achievable scores. By passing ground truth labels through a resample and inference-resolution round trip, we discovered that the initial 1.5 mm target spacing configuration severely limited performance, capping the theoretical maximum DSC at 0.864. This configuration could not have won regardless of model quality. 
+
+In Task 1, 64.2\% of the mitral valve's voxels lie on its boundary, with a median maximum inscribed radius of 1.82 mm. Region losses integrating over volume systematically under-weight what HD and ASD measure for such thin structures. Furthermore, every case has exactly one connected component, justifying largest-connected-component postprocessing as a measured geometric property rather than an ad-hoc heuristic.
+
+In Task 3, cross-video generalization is the bottleneck. The unlabeled pool spans 45 distinct videos with zero overlap with the 6 labeled ones. We found evidence of a brightness shortcut: frames containing the valve are systematically brighter than background frames (mean green 0.337 vs 0.275, Cohen's $d = +0.80$). This permits a model to learn that bright frames imply a valve is present instead of learning the valve's actual appearance.
+
+\subsection{Task 1 Pipeline}
+
+\begin{itemize}
+    \item \textbf{Architecture:} STU-Net-B backbone~\cite{huang2023stunet}, supervised-pretrained on TotalSegmentator labels~\cite{totalseg}.
+    \item \textbf{Preprocessing:} Resampled to dataset median spacing per axis ($0.36 \times 0.36 \times 0.51$ mm). CT normalization matched the backbone's pretraining by clipping to foreground $[p_{0.5}, p_{99.5}] = [-98, 649]$ HU, then z-scoring ($\mu = 253.55, \sigma = 150.00$) following nnU-Net rules~\cite{isensee2021nnunet}.
+    \item \textbf{Training:} Patch size $128 \times 96 \times 96$, chosen because the valve exceeded a $96^3$ patch in the x-dimension for 78\% of cases. We used a loss function combining Dice, Cross-Entropy, and a signed-distance boundary term~\cite{kervadec2019boundary}.
+    \item \textbf{Inference:} 8-way mirror Test-Time Augmentation (TTA), Gaussian-weighted sliding window, probability-space resampling to the original grid before argmax, and largest-component postprocessing.
+\end{itemize}
+
+\subsection{Task 3 Pipeline}
+
+\begin{itemize}
+    \item \textbf{Architecture:} UNet++ with ResNet-34 encoder~\cite{zhou2019unet,he2016resnet}, ImageNet-initialized, operating at $256 \times 448$ resolution. We used mean-teacher semi-supervised learning~\cite{tarvainen2017mean} over the 45-video unlabeled pool.
+    \item \textbf{Augmentation:} Continuous affine augmentation (rotation $\pm 15^\circ$, scale $\pm 20\%$, shift $\pm 8\%$) and strong color augmentation to mitigate the brightness shortcut.
+\end{itemize}
+
+\subsection{Robustness Engineering}
+
+Because the organizers assign penalty metrics (DSC 0, HD/ASD $10^6$) to all tasks when the inference runner exits with a non-zero code, we isolate every case in a try-except block. We emit a best-effort mask on failure and never exit non-zero when any output exists. We also guard against non-invertible affine matrices present in the dataset.
+
+\section{Results}
+
+\subsection{Hidden Test Progression}
+
+Table~\ref{tab:progression} shows our progression on the hidden test set. Our final submission is version 11.
+
+\begin{table}[ht]
+\caption{Progression on the hidden test set across pipeline iterations.}\label{tab:progression}
+\centering\small
+\begin{tabular}{lccl}
+\toprule
+Version & Task 1 DSC / HD / ASD & Task 3 DSC / HD / ASD & Notes \\
+\midrule
+v1 & 0.489 / N/A / N/A & 0.667 / 535 / 131 & Baseline pipeline \\
+v4 & 0.651 / 7.04 / 0.902 & 0.672 / 359 / 80.0 & STU-Net backbone \\
+v6 & 0.621 / 28577 / 28572 & 0.691 / 297 / 83.6 & Hit empty prediction penalties \\
+v10 & 0.801 / 7.31 / 0.854 & 0.749 / 567 / 458 & Spacing corrected \\
+\textbf{v11} & \textbf{0.811 / 6.86 / 0.810} & \textbf{0.775 / 361 / 233} & \textbf{Final Submission} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablation}
+
+Table~\ref{tab:ablation} isolates the impact of individual pipeline components on our internal validation sets.
+
+\begin{table}[ht]
+\caption{Ablation of individual components on internal validation.}\label{tab:ablation}
+\centering\small
+\begin{tabular}{lccc}
+\toprule
+Change & $\Delta$ DSC & $\Delta$ HD & $\Delta$ ASD \\
+\midrule
+Spacing 1.5 mm $\rightarrow$ median & +0.18 & N/A & N/A \\
+nnU-Net normalization + strong aug + boundary loss & +0.009 & $-7.8\%$ & $-7.7\%$ \\
+Patch $96^3 \rightarrow 128 \times 96 \times 96$, 250 $\rightarrow$ 480 epochs & +0.004 & +0.12 & $-0.004$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Negative Results}
+
+Reporting negative findings forms the core of our diagnostic analysis:
+\begin{itemize}
+    \item \textbf{Validation in resampled space is misleading:} The same checkpoint on the same cases scored 0.757 in resampled space versus 0.650 in original image space. This gap was misattributed to overfitting for several iterations.
+    \item \textbf{Foreground-only validation hides false positives:} With foreground-only validation enabled, a checkpoint predicting a valve on 87\% of background frames scored identically to one correctly predicting an empty mask.
+    \item \textbf{Snapshot ensembling failed:} Ensembling checkpoints from a single cosine decay yielded a negligible +0.0005 DSC gain, as the models were too correlated. 
+    \item \textbf{Higher Task 3 resolution did not help:} Increasing resolution from $256 \times 448$ yielded 0.711 DSC versus 0.742 at lower resolution. The $256 \times 448$ resolution already preserves sufficient anatomical detail, making higher resolutions unnecessary given the small dataset size of 120 labeled frames.
+    \item \textbf{Temporal smoothing rejected:} Labeled frames are 5 to 196 frames apart. Neighboring labeled frames are not temporally adjacent, rendering temporal smoothing ineffective.
+\end{itemize}
+
+\section{Discussion and Limitations}
+
+Our pipeline was constrained by training on a single 6 GB consumer GPU, limiting us to approximately 9,000 gradient steps compared to standard baselines of 250,000 steps, and preventing large multi-fold ensembles. 
+
+We observed a significant internal-to-real transfer gap. Our internal estimates consistently exceeded hidden-test results by roughly 0.03 to 0.04 DSC on Task 1 and occasionally inverted on Task 3. With only 27 CT cases and 6 videos for training, held-out estimates exhibit high variance. We recommend that future challenge participants weigh cross-video and cross-case variance more heavily than point estimates.
+
+\begin{thebibliography}{10}
+\bibitem{mvaa2026}
+MVAA 2026 Organizers: MVAA 2026 Challenge. MICCAI 2026 Medical World Model Workshop (2026)
+\bibitem{huang2023stunet}
+Huang, Z., et al.: STU-Net: Scalable and Transferable Medical Image Segmentation Models Empowered by Large-Scale Supervised Pre-training. arXiv:2304.06716 (2023)
+\bibitem{totalseg}
+Wasserthal, J., et al.: TotalSegmentator: Robust Segmentation of 104 Anatomical Structures in CT Images. Radiol.\ Artif.\ Intell.\ \textbf{5}(5), e230024 (2023)
+\bibitem{isensee2021nnunet}
+Isensee, F., et al.: nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. Nat.\ Methods \textbf{18}, 203--211 (2021)
+\bibitem{tarvainen2017mean}
+Tarvainen, A., Valpola, H.: Mean teachers are better role models: Weight-averaged consistency targets improve semi-supervised deep learning results. In: NeurIPS (2017)
+\bibitem{kervadec2019boundary}
+Kervadec, H., et al.: Boundary loss for highly unbalanced segmentation. In: MIDL 2019, PMLR, vol.\ 102, pp.\ 285--296 (2019)
+\bibitem{zhou2019unet}
+Zhou, Z., et al.: UNet++: Redesigning Skip Connections to Exploit Multiscale Features in Image Segmentation. IEEE Trans.\ Med.\ Imaging \textbf{39}(6), 1856--1867 (2020)
+\bibitem{he2016resnet}
+He, K., et al.: Deep Residual Learning for Image Recognition. In: CVPR 2016, pp.\ 770--778. IEEE (2016)
+\end{thebibliography}
+
+\end{document}
