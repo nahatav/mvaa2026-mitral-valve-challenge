@@ -1,9 +1,9 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.28 (MiKTeX 25.12) (preloaded format=pdflatex 2026.5.26)  1 AUG 2026 19:21
+This is pdfTeX, Version 3.141592653-2.6-1.40.28 (MiKTeX 25.12) (preloaded format=pdflatex 2026.5.26)  1 AUG 2026 19:36
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
-**./mvaa2026_paper.tex
-(mvaa2026_paper.tex
+**./MVAA2026_Report.tex
+(MVAA2026_Report.tex
 LaTeX2e <2025-11-01>
 L3 programming layer <2025-12-24>
 (llncs.cls
@@ -407,8 +407,8 @@ Package uniquecounter Info: New unique counter `rerunfilecheck' on input line 2
 tex.def
 File: l3backend-pdftex.def 2025-10-09 L3 backend support: PDF output (pdfTeX)
 \l__color_backend_stack_int=\count342
-) (mvaa2026_paper.aux)
-\openout1 = `mvaa2026_paper.aux'.
+) (MVAA2026_Report.aux)
+\openout1 = `MVAA2026_Report.aux'.
 
 LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 11.
 LaTeX Font Info:    ... okay on input line 11.
@@ -455,9 +455,9 @@ fg
 File: epstopdf-sys.cfg 2021/03/18 v2.0 Configuration of epstopdf for MiKTeX
 ))
 Package hyperref Info: Link coloring OFF on input line 11.
- (mvaa2026_paper.out) (mvaa2026_paper.out)
+ (MVAA2026_Report.out) (MVAA2026_Report.out)
 \@outlinefile=\write3
-\openout3 = `mvaa2026_paper.out'.
+\openout3 = `MVAA2026_Report.out'.
 
 
 Overfull \hbox (1.76239pt too wide) in paragraph at lines 31--32
@@ -492,27 +492,27 @@ tion (ro-ta-tion $\OMS/cmsy/m/n/10 ^^F\OT1/cmr/m/n/10 15[]$\T1/cmr/m/n/10 , sca
 le $\OMS/cmsy/m/n/10 ^^F\OT1/cmr/m/n/10 20%$\T1/cmr/m/n/10 ,
  []
 
-[2]
+
 Overfull \hbox (24.7332pt too wide) in paragraph at lines 80--91
  [][] 
  []
 
-[3] [4] [5] (mvaa2026_paper.aux)
+[2] [3] [4] (MVAA2026_Report.aux)
  ***********
 LaTeX2e <2025-11-01>
 L3 programming layer <2025-12-24>
  ***********
-Package rerunfilecheck Info: File `mvaa2026_paper.out' has not changed.
-(rerunfilecheck)             Checksum: C3F961B22E69946A38DF8236E14B15D6;638.
+Package rerunfilecheck Info: File `MVAA2026_Report.out' has not changed.
+(rerunfilecheck)             Checksum: 4C80CD9EF4DA08C66415F3567E70FDC1;509.
  ) 
 Here is how much of TeX's memory you used:
- 9894 strings out of 467871
- 150694 string characters out of 5418376
- 575406 words of memory out of 5000000
+ 9893 strings out of 467871
+ 150708 string characters out of 5418376
+ 577411 words of memory out of 5000000
  38642 multiletter control sequences out of 15000+600000
  637263 words of font info for 60 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 75i,9n,79p,877b,595s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 75i,9n,79p,878b,515s stack positions out of 10000i,1000n,20000p,200000b,200000s
  <C:\Users\Valmi\AppData\Local\MiKTeX\fonts/pk/ljfour/jknappen/ec/dpi600\ecbx
 1000.pk> <C:\Users\Valmi\AppData\Local\MiKTeX\fonts/pk/ljfour/jknappen/ec/dpi60
 0\ecbx1200.pk> <C:\Users\Valmi\AppData\Local\MiKTeX\fonts/pk/ljfour/jknappen/ec
@@ -533,9 +533,9 @@ lic/amsfonts/cm/cmr9.pfb><C:/Users/Valmi/AppData/Local/Programs/MiKTeX/fonts/ty
 pe1/public/amsfonts/cm/cmsy10.pfb><C:/Users/Valmi/AppData/Local/Programs/MiKTeX
 /fonts/type1/public/amsfonts/cm/cmsy7.pfb><C:/Users/Valmi/AppData/Local/Program
 s/MiKTeX/fonts/type1/public/amsfonts/cm/cmsy9.pfb>
-Output written on mvaa2026_paper.pdf (5 pages, 209570 bytes).
+Output written on MVAA2026_Report.pdf (4 pages, 208242 bytes).
 PDF statistics:
- 449 PDF objects out of 1000 (max. 8388607)
- 30 named destinations out of 1000 (max. 500000)
+ 443 PDF objects out of 1000 (max. 8388607)
+ 29 named destinations out of 1000 (max. 500000)
  9 words of extra memory for PDF output out of 10000 (max. 10000000)
 
