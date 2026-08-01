@@ -58,11 +58,17 @@ def drop_small_components_3d(mask: np.ndarray, min_vox: int = 20, min_rel_vox: f
 
 
 def sliding_window_tta(images: torch.Tensor, model, inferer, num_classes: int) -> torch.Tensor:
-    """Mirror-flip TTA for 3D sliding-window inference: average softmax probs
-    over identity + single-axis flips (spatial dims 2,3,4), matching the
-    standard nnU-Net-style boundary-precision trick. Free at inference time,
-    no extra training required."""
-    flip_dims_list = [None, (2,), (3,), (4,)]
+    """Full 8-way mirror TTA for 3D sliding-window inference: averages
+    softmax probs over the identity plus every combination of flips across
+    the three spatial axes (2,3,4) - the standard nnU-Net "mirroring"
+    recipe (their default at inference), vs. the single-axis-only subset
+    used previously. Inference-time only, no retraining required."""
+    import itertools
+
+    flip_dims_list: List[Tuple[int, ...] | None] = [None]
+    for r in range(1, 4):
+        flip_dims_list.extend(itertools.combinations((2, 3, 4), r))
+
     probs_sum = None
     for dims in flip_dims_list:
         x = images if dims is None else torch.flip(images, dims=dims)
@@ -196,7 +202,12 @@ def run_task1(input_root: Path, output_root: Path) -> None:
     ds = Dataset([{"image": f["image_path"], "case_id": f["case_id"]} for f in files], transform=transforms)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
 
-    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=0.25, mode="gaussian")
+    # overlap=0.5 matches nnU-Net's own default sliding-window overlap -
+    # denser window stitching, no retraining, meaningfully improves
+    # boundary-precision metrics (HD/ASD) at the cost of more compute per
+    # case. We have a 6-hour Codabench inference budget and were using a
+    # small fraction of it, so this is free headroom.
+    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=0.5, mode="gaussian")
 
     import nibabel as nib
 
@@ -273,7 +284,7 @@ def run_task2(input_root: Path, output_root: Path) -> None:
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=0.25, mode="gaussian")
+    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=0.5, mode="gaussian")
 
     import nibabel as nib
 
@@ -370,7 +381,7 @@ def run_task3(input_root: Path, output_root: Path) -> None:
     norm_std = torch.tensor(IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1).to(device)
     use_amp = device.type == "cuda"
 
-    def predict_probs(image_t: torch.Tensor) -> torch.Tensor:
+    def _flip_tta_probs(image_t: torch.Tensor) -> torch.Tensor:
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(image_t)
         probs = torch.sigmoid(logits)
@@ -382,6 +393,29 @@ def run_task3(input_root: Path, output_root: Path) -> None:
             probs_sum = probs_sum + torch.flip(torch.sigmoid(logits_f), dims=dims)
         return probs_sum / 4.0
 
+    # Multi-scale TTA: the model was trained at image_size, so that
+    # resolution stays the anchor scale; a second, moderately larger scale
+    # (divisible by 32 to satisfy the resnet encoder's stride, kept close
+    # to the native aspect ratio) is averaged in alongside it. This gives
+    # the network a second look at finer boundary detail without ever
+    # replacing the trained-resolution prediction, so it can only add
+    # information, not regress relative to single-scale inference.
+    scale_sizes = [image_size, (int(round(image_size[0] * 1.125 / 32)) * 32, int(round(image_size[1] * 1.125 / 32)) * 32)]
+
+    def predict_probs(image_raw_t: torch.Tensor) -> torch.Tensor:
+        """image_raw_t: [0,1]-scaled RGB tensor at native resolution (not yet
+        resized or imagenet-normalized) - each scale gets its own resize +
+        normalize so the two scales are genuinely independent looks."""
+        probs_sum = None
+        for size_hw in scale_sizes:
+            x = F.interpolate(image_raw_t, size=size_hw, mode="bilinear", align_corners=False)
+            if use_imagenet_norm:
+                x = (x - norm_mean) / norm_std
+            probs = _flip_tta_probs(x)
+            probs = F.interpolate(probs, size=image_size, mode="bilinear", align_corners=False)
+            probs_sum = probs if probs_sum is None else probs_sum + probs
+        return probs_sum / len(scale_sizes)
+
     records = []
     with torch.no_grad():
         for idx, info in enumerate(files, start=1):
@@ -392,9 +426,6 @@ def run_task3(input_root: Path, output_root: Path) -> None:
             h, w = image_u8.shape[:2]
             image_f = image_u8.astype(np.float32) / 255.0
             image_t = torch.from_numpy(image_f.transpose(2, 0, 1)).unsqueeze(0).to(device)
-            image_t = F.interpolate(image_t, size=image_size, mode="bilinear", align_corners=False)
-            if use_imagenet_norm:
-                image_t = (image_t - norm_mean) / norm_std
 
             probs = predict_probs(image_t)
             pred_small = (probs > threshold).float()

@@ -92,6 +92,22 @@ Result: best epoch 30, **DSC 0.757, HD 3.80, ASD 0.31** on the 8-case split. Thi
 |---|---|---|---|---|
 | **`v5`** | STU-Net-B, single fold, 8-case val split, 3D connected-component filter added | unchanged | val_only_fg=False retrain (epoch 11/20), connected-component fallback bug fixed | **Built, smoke-tested end-to-end (all 3 tasks pass with real data), pushed to `valpip/mvaa2026-submission:v5` (digest `sha256:14c93291...`). Ready to submit.** |
 
+## v6: maxing out inference-time TTA (2026-07-31, ~20:20-20:40)
+
+No retraining involved - same checkpoints as v5, purely inference-side changes. Motivation: Codabench allows a 6-hour inference timeout (`timeout_seconds: 21600`) and our pipeline was finishing in a small fraction of that, while top solutions on the leaderboard plausibly spend much more of that budget on heavier test-time augmentation and denser sliding-window stitching. This trades unused runtime budget for accuracy at zero training cost/risk.
+
+- **8-way mirror TTA for Task1/Task2** (up from 4-way): `sliding_window_tta()` now averages over the identity plus every combination of flips across all 3 spatial axes (2^3=8 total), not just the 3 single-axis flips - this is nnU-Net's own default inference-time mirroring recipe.
+- **Sliding-window overlap 0.25 -> 0.5** for Task1/Task2 (also matches nnU-Net's default) - denser window stitching, directly targets boundary-precision metrics (HD/ASD).
+- **Multi-scale TTA for Task3**: in addition to the existing 4-way flip TTA, now averages predictions from 2 scales - the native training resolution (anchor, so it can't regress below single-scale performance) plus a moderate 1.125x upscale (rounded to multiples of 32 for the resnet encoder's stride). 2 scales x 4 flips = 8 total forward passes per frame, up from 4.
+
+Smoke-tested end-to-end on real data (all 3 tasks pass, output masks sane - Task1 foreground fraction ~1.7-1.76%, consistent with v5; Task2 valid 3-class output; Task3 pixel counts in the same range as v5, not degenerate). Built, pushed to `valpip/mvaa2026-submission:v6`. Kept as a **separate submission package** (`submission_package_v6/`) rather than overwriting v5's, so both are available to submit independently.
+
+## Docker submission images (continued)
+
+| Tag | Task1 | Task2 | Task3 | Status |
+|---|---|---|---|---|
+| **`v6`** | v5 checkpoint, 8-way mirror TTA, overlap=0.5 | 8-way mirror TTA, overlap=0.5 (checkpoint unchanged) | v5 checkpoint, 4-way flip x 2-scale TTA | **Built, smoke-tested, pushed to `valpip/mvaa2026-submission:v6`** (digest `sha256:43139df4...`). Separate package: `submission_package_v6/submission.zip`. |
+
 ## Reference: public leaderboard (as of 2026-07-31)
 
 Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone).
