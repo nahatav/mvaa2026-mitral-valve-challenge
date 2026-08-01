@@ -291,3 +291,28 @@ Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone)
 
 - Task 1 DSC: top cluster **0.83–0.85** (leader: 0.8541)
 - Task 3 DSC: top **~0.85–0.86** (leader: 0.8593)
+
+## v9: both tasks improved and validated (2026-08-01, 07:00)
+
+**Task 3 SOTA run.** Warm-started from the v8 checkpoint; 150 labeled frames (1 val video instead of 2); strong colour augmentation (+/-30% per-channel, sized from the measured colour gap); full unsupervised ramp so `lambda_u` actually reached its 0.600 maximum (the previous run died at 0.44, barely using the 45-video unlabeled pool); and checkpoint selection rebalanced to equal DSC/HD/ASD with refs at the real operating point instead of the saturated defaults. Best epoch 63/70.
+
+Head-to-head on the held-out video that neither model trained on, through the identical production pipeline:
+
+| | fg DSC | background false positives |
+|---|---|---|
+| v8 checkpoint | 0.8018 | 2/11 |
+| **v9 checkpoint** | **0.8201** | **0/11** |
+
+Across all 6 videos, false positives fell from 5/62 to 1/62. **The false positives were eliminated without the confidence gate being applied** - which is direct evidence for the Clever-Hans diagnosis: decorrelating brightness from valve presence removed the shortcut the model had been leaning on. The gate is retained at 0.60 purely as insurance; it is now a no-op (identical metrics up to a 0.9 threshold).
+
+**Combined v9 vs v8, on held-out data:**
+
+| metric | v8 | v9 |
+|---|---|---|
+| Task1 DSC / HD / ASD | 0.8341 / 4.477 / 0.2980 | **0.8435 / 4.126 / 0.2751** |
+| Task3 fg DSC | 0.8018 | **0.8201** |
+| Task3 bg false positives | 2/11 | **0/11** |
+
+Every measured metric improved. Smoke-tested end-to-end (all three tasks pass, 363s, Task 1 output a single connected component at 1.86-2.0% foreground, `ct_norm=nnunet` correctly propagated from checkpoint to inference so training and inference normalization cannot silently diverge). Pushed as `valpip/mvaa2026-submission:v9`, package in `submission_package_v9/`.
+
+**Caveat carried forward:** the Task 1 model is still the epoch-250-of-320 checkpoint rescued from the disk-full crash, so it is undertrained relative to its own schedule. And the largest measured lever remains untouched - the valve exceeds the 96^3 training patch in 78% of cases.
