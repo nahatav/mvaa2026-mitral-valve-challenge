@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-weights", type=str, default="none", choices=["none", "imagenet"])
     parser.add_argument("--target-label", type=int, default=10)
     parser.add_argument("--init-ckpt", type=str, default=None, help="Warm-start weights from an existing checkpoint")
+    parser.add_argument("--affine-prob", type=float, default=0.0,
+                        help="Probability of random rotation/scale/shift jitter on labeled train samples")
     parser.add_argument("--image-size", type=int, nargs=2, default=[448, 800], help="H W")
 
     parser.add_argument("--epochs", type=int, default=200)
@@ -384,6 +386,7 @@ def main() -> int:
         cache_masks=bool(args.cache_masks),
         use_imagenet_norm=bool(args.use_imagenet_norm),
         seed=int(args.seed),
+        affine_prob=float(args.affine_prob),
     )
     val_ds = LabeledDataset(
         samples=val_samples,

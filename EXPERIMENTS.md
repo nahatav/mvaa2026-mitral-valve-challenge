@@ -162,6 +162,29 @@ Worse on every metric, with `train_dice` climbing to 0.85 while validation stall
 |---|---|---|---|---|
 | **`v7`** | **STU-Net-B at native spacing 0.36/0.36/0.51, single ckpt (epoch 90), 8-way TTA, overlap 0.5, prob-space resampling, largest-CC** | unchanged | unchanged from v5fix (hires fine-tune rejected) | **Built, smoke-tested (all 3 tasks pass, outputs sane: Task1 1.77-1.92% fg, 1 component), pushed `valpip/mvaa2026-submission:v7` (`sha256:41254495...`). Package: `submission_package_v7/`.** |
 
+## v8: Task 3 - the augmentation was the bottleneck (2026-08-01)
+
+**Result: Task 3 foreground DSC 0.7744 -> 0.8018 (+0.027)** on a fair head-to-head - same held-out video (`REC_20250322`, which *neither* checkpoint trained on), scored at original 720x1280 resolution through the exact production `infer.py` pipeline (2-scale + 4-way flip TTA, probability upsampling, checkpoint threshold, connected-component filter). Background false positives unchanged at 2/11.
+
+**Diagnosis.** Task 3's geometric augmentation was only axis flips and 90-degree rotations. Both of those map the pixel grid onto itself, so they generate no genuinely new geometry - the model never saw an intermediate pose or scale. With 120 labeled frames the result was the classic under-augmentation signature: `train_dice` 0.85 against `val_dice` 0.69, with validation peaking at epoch 11 and declining afterwards.
+
+**Fix.** Added `_affine_jitter` to `baseline_ref/task3/dataset.py` (new `--affine-prob` flag): continuous random rotation (+/-15 deg), scale (+/-20%) and translation (+/-8%), applied through a single shared `affine_grid` so image and mask stay aligned - bilinear for the image, **nearest for the mask** so labels stay strictly binary (unit-tested: mask values remain exactly {0,1} while foreground area varies with scale). Also raised the labeled training set from 120 to 150 frames by moving from a 2-video to a 1-video validation split (`--val-video-count 1`).
+
+The overfitting gap closed and the model kept improving far longer:
+
+| | train_dice | val_dice | best epoch |
+|---|---|---|---|
+| before (flips + rot90 only) | 0.85 | 0.69 | 11/20 |
+| after (+ affine jitter, +25% data) | 0.83 | 0.77 | 23/26 |
+
+**Note on comparing runs:** the new run validates on 1 video and the old on 2, so their logged `val_dice` values are NOT comparable. That is exactly why the head-to-head above was run on a single common video with a single common pipeline, rather than trusting the two runs' own reported numbers.
+
+**Task 1 second fold: attempted, abandoned deliberately.** Launched a genuine different-split fold (seed 123) to build the kind of cross-validation ensemble the literature actually supports (unlike the correlated snapshot ensemble, which measured +0.0005). Running it concurrently with Task 3 caused GPU contention on the 6GB card - fold 2 slowed to 55s/epoch and projected past the time budget - so it was killed in favour of Task 3. The gap arithmetic drove the call: Task 1 sits 0.02 from the leader (0.834 vs 0.8541) while Task 3 was 0.17 away (0.69 vs 0.8593). Splitting the budget would have half-finished both. Task 1 fold 2 remains the obvious next move given a longer window.
+
+| Tag | Task1 | Task2 | Task3 | Status |
+|---|---|---|---|---|
+| **`v8`** | unchanged from v7 (native spacing, DSC 0.834) | unchanged | **affine jitter + 150 frames, epoch 23 (fgDSC 0.8018 vs 0.7744)** | **Built, smoke-tested (all 3 pass, 193s, Task1 1 component / 1.8-1.9% fg), pushed `valpip/mvaa2026-submission:v8` (`sha256:509fb582...`). Package: `submission_package_v8/`.** |
+
 ## Reference: public leaderboard (as of 2026-07-31)
 
 Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone).

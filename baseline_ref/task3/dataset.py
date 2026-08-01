@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import math
 import random
 import re
 import tarfile
@@ -230,6 +231,44 @@ def _apply_geom(image: np.ndarray, hflip: bool, vflip: bool, rot_k: int) -> np.n
     return out
 
 
+def _affine_jitter(
+    image_t: torch.Tensor,
+    mask_t: torch.Tensor,
+    rng: random.Random,
+    max_rot_deg: float = 15.0,
+    max_scale: float = 0.20,
+    max_shift: float = 0.08,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Random rotation / scale / translation applied identically to image and mask.
+
+    The existing geometric augmentation only did axis flips and 90-degree
+    rotations - both of which map the pixel grid onto itself, so they add no
+    genuinely new geometry. With only ~120 labeled frames the model overfits
+    hard (train_dice 0.85 vs val_dice 0.69), which is the classic signature of
+    too-weak geometric augmentation. Continuous affine jitter gives the network
+    intermediate poses and scales it never sees otherwise.
+
+    Bilinear for the image, nearest for the mask so labels stay binary.
+    """
+    angle = math.radians(rng.uniform(-max_rot_deg, max_rot_deg))
+    scale = 1.0 + rng.uniform(-max_scale, max_scale)
+    tx = rng.uniform(-max_shift, max_shift)
+    ty = rng.uniform(-max_shift, max_shift)
+
+    cos_a = math.cos(angle) / scale
+    sin_a = math.sin(angle) / scale
+    theta = torch.tensor(
+        [[cos_a, -sin_a, tx], [sin_a, cos_a, ty]], dtype=torch.float32
+    ).unsqueeze(0)
+
+    img = image_t.unsqueeze(0)
+    msk = mask_t.unsqueeze(0)
+    grid = F.affine_grid(theta, list(img.shape), align_corners=False)
+    img = F.grid_sample(img, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+    msk = F.grid_sample(msk, grid, mode="nearest", padding_mode="zeros", align_corners=False)
+    return img.squeeze(0), msk.squeeze(0)
+
+
 def _photo_aug_weak(img: np.ndarray, rng: random.Random) -> np.ndarray:
     if rng.random() < 0.5:
         contrast = 1.0 + rng.uniform(-0.10, 0.10)
@@ -273,11 +312,13 @@ class LabeledDataset(torch.utils.data.Dataset):
         cache_masks: bool,
         use_imagenet_norm: bool,
         seed: int,
+        affine_prob: float = 0.0,
     ) -> None:
         self.samples = list(samples)
         self.image_size = image_size
         self.target_label = int(target_label)
         self.train = bool(train)
+        self.affine_prob = float(affine_prob)
         self.cache_masks = bool(cache_masks)
         self.use_imagenet_norm = bool(use_imagenet_norm)
         self.rng = random.Random(seed)
@@ -326,6 +367,11 @@ class LabeledDataset(torch.utils.data.Dataset):
         if tuple(image_t.shape[1:]) != self.image_size:
             image_t = _resize_chw(image_t, self.image_size, mode="bilinear")
             mask_t = F.interpolate(mask_t.unsqueeze(0), size=self.image_size, mode="nearest").squeeze(0)
+
+        # Affine jitter after the resize so it operates at the network's input
+        # resolution (cheaper, and the sampling grid matches what the model sees).
+        if self.train and self.affine_prob > 0.0 and self.rng.random() < self.affine_prob:
+            image_t, mask_t = _affine_jitter(image_t, mask_t, self.rng)
 
         image_t = _normalize_if_needed(image_t, self.use_imagenet_norm)
         return {
