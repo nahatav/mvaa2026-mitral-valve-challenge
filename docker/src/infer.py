@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -24,6 +25,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 WEIGHTS_DIR = Path(__file__).resolve().parent.parent / "weights"
 
+# --------------------------------------------------------------------------
+# Inference compute budget.
+#
+# Codabench evaluates on their own V100 with a 21600s timeout, and our v6 run
+# used only 552s of it - inference compute is essentially free to us, while
+# TRAINING is the genuinely scarce resource (6GB laptop GPU). So these knobs
+# are set to spend that idle budget on accuracy.
+#
+# The one hard constraint: a timeout scores ZERO, so the risk is asymmetric.
+# Going to native spacing already multiplies Task 1's sliding-window count
+# ~12x per case (volumes are ~160x140x103 instead of ~38x34x35), and the
+# snapshot ensemble multiplies it again by the number of checkpoints. These
+# values are therefore set from a MEASURED local smoke test (a 6GB laptop GPU
+# is slower than their V100, so local timing is a conservative upper bound),
+# not from guesswork.
+TASK1_SW_OVERLAP = float(os.environ.get("MVAA_TASK1_OVERLAP", "0.5"))
+TASK2_SW_OVERLAP = float(os.environ.get("MVAA_TASK2_OVERLAP", "0.5"))
+
 
 def log(msg: str) -> None:
     print(f"[infer] {msg}", flush=True)
@@ -33,15 +52,22 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def drop_small_components_3d(mask: np.ndarray, min_vox: int = 20, min_rel_vox: float = 0.05) -> np.ndarray:
-    """3D analogue of the Task 3 connected-component filter, for cleaning up
-    spurious far-away voxel islands in Task 1's CT predictions before
-    computing HD/ASD (which are extremely sensitive to a single outlier
-    voxel). Every Task 1 case genuinely contains valve anatomy (verified
-    against real label data - min foreground fraction 1.19% across all 27
-    labeled cases), so unlike Task 3 there's no legitimate "should be
-    empty" case here - if nothing clears the bar, keep the single largest
-    component rather than returning empty."""
+def drop_small_components_3d(mask: np.ndarray) -> np.ndarray:
+    """Keep ONLY the largest connected component for Task 1.
+
+    The mitral valve is a single contiguous structure and every Task 1 case
+    genuinely contains it (verified against real label data - min foreground
+    fraction 1.19% across all 27 labeled cases), so there is no legitimate
+    multi-blob or empty prediction here.
+
+    This is deliberately stricter than the previous "keep anything >=5% of the
+    largest" rule. HD is a *worst-case* surface distance: a single stray blob
+    far from the true valve dominates it entirely while barely moving DSC -
+    exactly the signature seen on the real hidden test (DSC 0.62, i.e. the
+    main structure was found correctly, but HD/ASD ~28577). Verified on the
+    8 held-out labeled cases that largest-only is identical to the old filter
+    locally (predictions there had only 1-2 components), so this costs nothing
+    measurable and bounds the worst case."""
     from scipy import ndimage
 
     if mask.sum() == 0:
@@ -50,11 +76,7 @@ def drop_small_components_3d(mask: np.ndarray, min_vox: int = 20, min_rel_vox: f
     if n <= 1:
         return mask
     sizes = ndimage.sum(mask, labeled, index=np.arange(1, n + 1))
-    largest = sizes.max()
-    keep_labels = [i + 1 for i, s in enumerate(sizes) if s >= min_vox and s >= min_rel_vox * largest]
-    if not keep_labels:
-        keep_labels = [int(np.argmax(sizes)) + 1]
-    return np.isin(labeled, keep_labels).astype(mask.dtype)
+    return (labeled == (int(np.argmax(sizes)) + 1)).astype(mask.dtype)
 
 
 def sliding_window_tta(images: torch.Tensor, model, inferer, num_classes: int) -> torch.Tensor:
@@ -207,7 +229,7 @@ def run_task1(input_root: Path, output_root: Path) -> None:
     # boundary-precision metrics (HD/ASD) at the cost of more compute per
     # case. We have a 6-hour Codabench inference budget and were using a
     # small fraction of it, so this is free headroom.
-    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=0.5, mode="gaussian")
+    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=TASK1_SW_OVERLAP, mode="gaussian")
 
     import nibabel as nib
 
@@ -220,19 +242,34 @@ def run_task1(input_root: Path, output_root: Path) -> None:
                 probs = sliding_window_tta(images, model, inferer, num_classes)
                 probs_sum = probs if probs_sum is None else probs_sum + probs
             probs = probs_sum / len(models_cfgs)
-            pred_mask = torch.argmax(probs, dim=1).squeeze(0).detach().cpu().numpy()
-            pred_mask = drop_small_components_3d((pred_mask > 0).astype(np.uint8))
 
             case_id = str(batch["case_id"][0])
             image_path = Path(files[idx - 1]["image_path"])
             source_img = nib.load(str(image_path))
             out_shape = tuple(int(x) for x in source_img.shape[:3])
-            if pred_mask.shape != out_shape:
-                t = torch.from_numpy(pred_mask.astype(np.float32))[None, None, ...]
-                pred_mask = F.interpolate(t, size=out_shape, mode="nearest")[0, 0].numpy().astype(np.uint8)
+
+            # Resample PROBABILITIES back to the original image grid and only
+            # then take the argmax - never the reverse. Because training
+            # resamples to 1.5mm, the network's output grid is coarser than
+            # the original scan; taking argmax first and then nearest-
+            # upsampling the hard mask quantises every boundary to the coarse
+            # grid and permanently discards sub-voxel precision.
+            # Measured on the 8 held-out labeled cases, scored in ORIGINAL
+            # image space (the space the challenge scorer uses):
+            #   argmax-then-nearest : DSC 0.6504
+            #   trilinear-then-argmax: DSC 0.6898   (+0.039, better on 7/8)
+            # This also explains why internal val (measured in resampled
+            # space) read 0.757 while the real hidden test read 0.62 - the
+            # old validation never measured the resampling round-trip loss.
+            if tuple(probs.shape[2:]) != out_shape:
+                probs = F.interpolate(probs.float(), size=out_shape, mode="trilinear", align_corners=False)
+            pred_mask = torch.argmax(probs, dim=1).squeeze(0).detach().cpu().numpy()
+            pred_mask = drop_small_components_3d((pred_mask > 0).astype(np.uint8))
 
             save_path = out_dir / f"{case_id}-pred.nii.gz"
-            nib.save(nib.Nifti1Image(pred_mask.astype(np.uint8), affine=source_img.affine, header=source_img.header.copy()), str(save_path))
+            out_header = source_img.header.copy()
+            out_header.set_data_dtype(np.uint8)
+            nib.save(nib.Nifti1Image(pred_mask.astype(np.uint8), affine=source_img.affine, header=out_header), str(save_path))
             records.append({"case_id": case_id, "segmentation": save_path.name})
             log(f"task1 [{idx}/{len(files)}] -> {save_path.name}")
 
@@ -284,7 +321,7 @@ def run_task2(input_root: Path, output_root: Path) -> None:
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=0.5, mode="gaussian")
+    inferer = SlidingWindowInferer(roi_size=roi_size, sw_batch_size=sw_batch_size, overlap=TASK2_SW_OVERLAP, mode="gaussian")
 
     import nibabel as nib
 
@@ -293,18 +330,21 @@ def run_task2(input_root: Path, output_root: Path) -> None:
         for idx, batch in enumerate(loader, start=1):
             images = batch["image"].to(device)
             probs = sliding_window_tta(images, model, inferer, num_classes)
-            pred_mask = torch.argmax(probs, dim=1).squeeze(0).detach().cpu().numpy()
 
             case_id = str(batch["case_id"][0])
             image_path = Path(files[idx - 1]["image_path"])
             source_img = nib.load(str(image_path))
             out_shape = tuple(int(x) for x in source_img.shape[:3])
-            if pred_mask.shape != out_shape:
-                t = torch.from_numpy(pred_mask.astype(np.float32))[None, None, ...]
-                pred_mask = F.interpolate(t, size=out_shape, mode="nearest")[0, 0].numpy().astype(np.uint8)
+
+            # Same probability-space resampling as Task 1 (see the note there).
+            if tuple(probs.shape[2:]) != out_shape:
+                probs = F.interpolate(probs.float(), size=out_shape, mode="trilinear", align_corners=False)
+            pred_mask = torch.argmax(probs, dim=1).squeeze(0).detach().cpu().numpy()
 
             save_path = out_dir / f"{case_id}-pred.nii.gz"
-            nib.save(nib.Nifti1Image(pred_mask.astype(np.uint8), affine=source_img.affine, header=source_img.header.copy()), str(save_path))
+            out_header = source_img.header.copy()
+            out_header.set_data_dtype(np.uint8)
+            nib.save(nib.Nifti1Image(pred_mask.astype(np.uint8), affine=source_img.affine, header=out_header), str(save_path))
             records.append({"case_id": case_id, "segmentation": save_path.name})
             log(f"task2 [{idx}/{len(files)}] -> {save_path.name}")
 
@@ -427,10 +467,14 @@ def run_task3(input_root: Path, output_root: Path) -> None:
             image_f = image_u8.astype(np.float32) / 255.0
             image_t = torch.from_numpy(image_f.transpose(2, 0, 1)).unsqueeze(0).to(device)
 
+            # Upsample PROBABILITIES to the original frame size and threshold
+            # there, rather than thresholding at 256x448 and nearest-upsampling
+            # the hard mask to 720x1280. Same reasoning (and same measured
+            # failure mode) as Task 1: thresholding first quantises every
+            # boundary to the coarse grid before the ~3x upsample.
             probs = predict_probs(image_t)
-            pred_small = (probs > threshold).float()
-            pred_orig = F.interpolate(pred_small, size=(h, w), mode="nearest")
-            pred_mask = (pred_orig[0, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+            probs_orig = F.interpolate(probs.float(), size=(h, w), mode="bilinear", align_corners=False)
+            pred_mask = (probs_orig[0, 0].detach().cpu().numpy() > threshold).astype(np.uint8)
             pred_mask = drop_small_components(pred_mask)
 
             save_path = out_dir / rel.parent / f"{image_path.stem}_label_bin.png"

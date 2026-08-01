@@ -9,7 +9,7 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
-from monai.data import DataLoader, Dataset, list_data_collate
+from monai.data import CacheDataset, DataLoader, Dataset, list_data_collate
 from monai.transforms import (
     Compose,
     EnsureChannelFirstd,
@@ -305,7 +305,16 @@ def get_task1_dataloaders(
     if max_val_cases > 0:
         val_files = val_files[:max_val_cases]
 
-    labeled_ds = Dataset(
+    # CacheDataset for the (small) labeled set: it caches everything up to the
+    # first random transform, so the expensive deterministic prefix - load +
+    # spacing resample + intensity scaling - runs ONCE instead of every epoch,
+    # while RandCropByPosNegLabeld still re-randomises per epoch. At native
+    # spacing the resample dominates epoch time (measured ~50s/epoch without
+    # caching, with the GPU idle waiting on CPU), and there are only ~19
+    # labeled volumes (~10MB each) so the memory cost is negligible.
+    # NOTE: deliberately NOT applied to unlabeled_ds - that is ~1040 volumes
+    # and caching it would exhaust RAM.
+    labeled_ds = CacheDataset(
         train_labeled,
         transform=get_labeled_train_transforms(
             roi_size=roi_size,
@@ -313,6 +322,9 @@ def get_task1_dataloaders(
             enable_spacing_resample=enable_spacing_resample,
             target_spacing=target_spacing,
         ),
+        cache_rate=1.0,
+        num_workers=0,
+        copy_cache=False,
     )
     unlabeled_ds = Dataset(
         train_unlabeled,

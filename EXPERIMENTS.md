@@ -108,6 +108,60 @@ Smoke-tested end-to-end on real data (all 3 tasks pass, output masks sane - Task
 |---|---|---|---|---|
 | **`v6`** | v5 checkpoint, 8-way mirror TTA, overlap=0.5 | 8-way mirror TTA, overlap=0.5 (checkpoint unchanged) | v5 checkpoint, 4-way flip x 2-scale TTA | **Built, smoke-tested, pushed to `valpip/mvaa2026-submission:v6`** (digest `sha256:43139df4...`). Separate package: `submission_package_v6/submission.zip`. |
 
+## v7: THE big one - target spacing was destroying Task 1 (2026-08-01)
+
+**Result first: Task 1 internal DSC went 0.650 -> 0.834 (+0.18), measured in original image space on the same 8 held-out cases.** That moves Task 1 from second-to-last on the leaderboard into the top cluster (0.83-0.85). No architecture change, no extra data, ~35 min of training.
+
+**The bug.** Every Task 1 run since v3 resampled to `1.5mm` isotropic. The data's real spacing is **0.356 x 0.356 x 0.509 mm** with volumes ~163x143x103. Resampling to 1.5mm collapsed every volume to **~38x34x35 voxels** - a 4.2x downsample per axis, ~75x fewer voxels - and since `--roi-size` was `96^3`, *the training patch was larger than the entire resampled volume*, so the network trained mostly on padding. The 1.5mm figure had been chosen to match the old SegResNet checkpoint's pretraining spacing and was never revisited after the backbone was swapped to STU-Net.
+
+**How it hid for so long.** `train.py` validates in the *resampled* space, but the challenge scorer evaluates in *original* image space. Those are not the same number when the resample throws away 75x the voxels. Measured directly on the same checkpoint and the same 8 cases:
+
+| space | DSC |
+|---|---|
+| resampled 1.5mm (what internal val reported) | 0.757 |
+| original image space (what the scorer measures) | 0.650 |
+
+That 0.107 gap is pure resampling round-trip loss, and it explains the whole "internal val says 0.75-0.81, hidden test says 0.65" mystery that had been blamed on overfitting and small-val-set noise for several versions.
+
+**The fix** is nnU-Net's own rule, which we had simply not followed: resample to the dataset's **median spacing per axis**. Set `--target-spacing 0.36 0.36 0.51`. The 2024 [nnU-Net Revisited](https://arxiv.org/abs/2404.09556) benchmark makes the general point - properly configured CNN U-Nets beat Transformer/Mamba architectures, and the wins come from configuration (spacing, patch size, normalization), not novel blocks. Our deviation from that configuration *was* the gap.
+
+**Training run** (`runs/task1_nat`): STU-Net-B, native spacing, roi 96^3, batch 1, supervised-only, 90 epochs, 35 min total.
+- Disabled in-training validation: MONAI's exact Hausdorff is CPU-bound and takes ~2 min/case at 2.3M voxels (GPU sits at 2%), which would have consumed the entire time budget. `latest_model.pt` saves every epoch, so checkpoints were evaluated offline with a fast DSC-only script instead.
+- Switched `labeled_ds` to `CacheDataset` - the deterministic prefix (load + spacing resample + intensity scaling) was re-running every epoch with the GPU idle. Epoch time 50s -> 18s. Deliberately *not* applied to the ~1040 unlabeled volumes, which would exhaust RAM.
+
+**Snapshot ensemble: measured, and it does essentially nothing here.** Captured epochs 56/73/90 during the single run for a free inference-time ensemble ([Snapshot Ensembles](https://openreview.net/pdf?id=BJYwwY9ll)):
+
+| checkpoint | DSC (original space, no TTA) | 
+|---|---|
+| s1 (epoch 56) | 0.8286 |
+| s2 (epoch 73) | 0.8315 |
+| s3 (epoch 90) | 0.8341 |
+| ensemble of all 3 | 0.8346 |
+
++0.0005 over the best single checkpoint - noise. This is the predicted outcome: real snapshot ensembles get their diversity from a *cyclic* LR schedule that drives the model into different minima, whereas ours is a single cosine decay, so the three checkpoints sit on one trajectory and are highly correlated. Recorded here because it's a genuine negative result, and because it means the 3x inference cost buys nothing measurable.
+
+**Other things checked and rejected (negative results worth keeping):**
+- *Temporal smoothing for Task 3*: frames are NOT densely consecutive - median gap 5-17 frames, max 196. In a beating-heart surgical video, "neighbouring" labeled frames are seconds apart, so averaging across them would blur real motion. Dropped before implementing.
+- *The astronomic HD (28577) on Task 1*: not our bug. `cemrg` (Task3 HD 23777) and `willenhou` (Task1 HD 14291) show the same signature on the public leaderboard - it's a scorer sentinel on some degenerate case, not something our postprocessing caused.
+- *Task 3 HD ~300 is normal*: the entire top of the leaderboard sits at 146-592 HD / 28-481 ASD for Task 3. Our 359/80 was mid-pack, not a defect. Time spent chasing it would have been wasted.
+
+**A note on the evaluation's honesty.** The 8 cases are held out of training, but they've now informed several decisions (probability-space upsampling, largest-component postprocessing, checkpoint selection). Each reuse leaks a little, so these numbers are mildly optimistic relative to the hidden test. With 27 labeled cases there's no clean alternative. The 0.650->0.834 jump is far too large to be a selection artifact, but treat the third decimal as noise.
+
+**Task 3 higher-resolution fine-tune: tried and REJECTED.** Added a `--init-ckpt` warm-start flag to `baseline_ref/task3/train.py` and fine-tuned the existing model from 256x448 up to 384x672 (the frames are natively 720x1280, so the same "you're throwing away resolution" logic that fixed Task 1 seemed to apply). It did not transfer:
+
+| | val_dice | composite score |
+|---|---|---|
+| existing checkpoint (256x448) | **0.7420** | **0.5677** |
+| hires fine-tune, best epoch 6/15 | 0.7108 | 0.5089 |
+
+Worse on every metric, with `train_dice` climbing to 0.85 while validation stalled around 0.69 - overfitting. 120 labeled frames is not enough to re-adapt the encoder to a new input resolution in 15 epochs. Kept the existing Task 3 checkpoint. Useful reminder that a fix which produces a huge win on one task is not automatically right for another.
+
+**Final v7 configuration and measured inference cost.** Single best checkpoint (epoch 90) rather than the 3-snapshot ensemble, because the ensemble's +0.0005 is noise and tripling inference cost only buys timeout exposure - and a timeout scores zero. Measured end-to-end smoke test: **279s** for 2 Task1 + 2 Task2 + 6 Task3 inputs (~90-140s per Task 1 case with full 8-way TTA at native spacing). Extrapolated to a ~25-case hidden test that is roughly 4500s against the 21600s budget - about 4.8x margin. Kept sliding-window overlap at nnU-Net's default 0.5 rather than spending the remaining margin on an unverified increase.
+
+| Tag | Task1 | Task2 | Task3 | Status |
+|---|---|---|---|---|
+| **`v7`** | **STU-Net-B at native spacing 0.36/0.36/0.51, single ckpt (epoch 90), 8-way TTA, overlap 0.5, prob-space resampling, largest-CC** | unchanged | unchanged from v5fix (hires fine-tune rejected) | **Built, smoke-tested (all 3 tasks pass, outputs sane: Task1 1.77-1.92% fg, 1 component), pushed `valpip/mvaa2026-submission:v7` (`sha256:41254495...`). Package: `submission_package_v7/`.** |
+
 ## Reference: public leaderboard (as of 2026-07-31)
 
 Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone).

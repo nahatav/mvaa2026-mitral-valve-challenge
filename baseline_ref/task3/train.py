@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-name", type=str, default="efficientnet-b4")
     parser.add_argument("--encoder-weights", type=str, default="none", choices=["none", "imagenet"])
     parser.add_argument("--target-label", type=int, default=10)
+    parser.add_argument("--init-ckpt", type=str, default=None, help="Warm-start weights from an existing checkpoint")
     parser.add_argument("--image-size", type=int, nargs=2, default=[448, 800], help="H W")
 
     parser.add_argument("--epochs", type=int, default=200)
@@ -494,6 +495,17 @@ def main() -> int:
         in_channels=3,
         classes=1,
     ).to(device)
+
+    # Warm-start from an existing checkpoint. Used to fine-tune an already
+    # converged model at a higher input resolution instead of retraining from
+    # scratch - the encoder/decoder weights are resolution-agnostic (fully
+    # convolutional), so this transfers cleanly and converges in far fewer
+    # epochs than a cold start.
+    if getattr(args, "init_ckpt", None):
+        _ck = torch.load(args.init_ckpt, map_location="cpu")
+        _state = _ck.get("model_state") or _ck.get("model_state_dict") or _ck.get("state_dict") or _ck
+        model.load_state_dict(_state, strict=True)
+        logger.info("Warm-started model from %s", args.init_ckpt)
 
     teacher = copy.deepcopy(model).to(device)
     teacher.eval()
