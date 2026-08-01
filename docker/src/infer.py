@@ -43,6 +43,12 @@ WEIGHTS_DIR = Path(__file__).resolve().parent.parent / "weights"
 TASK1_SW_OVERLAP = float(os.environ.get("MVAA_TASK1_OVERLAP", "0.5"))
 TASK2_SW_OVERLAP = float(os.environ.get("MVAA_TASK2_OVERLAP", "0.5"))
 
+# Task 3 frame-level confidence gate - see the long note in run_task3().
+# A frame only gets a prediction if its most confident predicted pixel clears
+# this bar; otherwise it is emitted empty. Targets false positives on
+# background frames, which are the dominant driver of Task 3 HD/ASD.
+TASK3_FRAME_CONF_GATE = float(os.environ.get("MVAA_TASK3_CONF_GATE", "0.60"))
+
 
 def log(msg: str) -> None:
     print(f"[infer] {msg}", flush=True)
@@ -167,6 +173,12 @@ def _load_task1_model(ckpt_path: Path, device: torch.device):
     enable_spacing_resample = bool(train_args.get("enable_spacing_resample", False))
     target_spacing = tuple(train_args.get("target_spacing", [0.5, 0.5, 0.5]))
 
+    # Which CT normalization the checkpoint was TRAINED with. Inference must
+    # match exactly - feeding a differently-normalized image to the network is
+    # a silent distribution shift that degrades everything. Defaults to the
+    # legacy fixed window so pre-existing checkpoints keep working.
+    ct_norm = str(train_args.get("ct_norm", "window"))
+
     model = get_model(name=model_name, model_size=model_size, in_channels=1, out_channels=num_classes, pretrained_ckpt=None).to(device)
     state = ckpt.get("student_state_dict") or ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
     model.load_state_dict(state, strict=True)
@@ -174,6 +186,7 @@ def _load_task1_model(ckpt_path: Path, device: torch.device):
     return model, dict(
         num_classes=num_classes, roi_size=roi_size, sw_batch_size=sw_batch_size,
         enable_spacing_resample=enable_spacing_resample, target_spacing=target_spacing,
+        ct_norm=ct_norm,
     )
 
 
@@ -210,16 +223,30 @@ def run_task1(input_root: Path, output_root: Path) -> None:
     if not files:
         raise RuntimeError("task1: no input images discovered")
 
+    ct_norm = models_cfgs[0][1]["ct_norm"]
+    log(f"task1: ct_norm={ct_norm} spacing_resample={enable_spacing_resample} target_spacing={target_spacing}")
+
     transform_list = [
         LoadImaged(keys=["image"]),
         EnsureChannelFirstd(keys=["image"]),
     ]
     if enable_spacing_resample:
         transform_list.append(Spacingd(keys=["image"], pixdim=target_spacing, mode="bilinear"))
-    transform_list += [
-        ScaleIntensityRanged(keys=["image"], a_min=-1000.0, a_max=1000.0, b_min=0.0, b_max=1.0, clip=True),
-        EnsureTyped(keys=["image"]),
-    ]
+    if ct_norm == "nnunet":
+        # Must mirror baseline_ref/task1/dataset.py ct_intensity_transforms():
+        # clip to this dataset's foreground [p0.5, p99.5] then z-score by the
+        # foreground mean/std, matching how STU-Net was pretrained.
+        from monai.transforms import NormalizeIntensityd
+        transform_list += [
+            ScaleIntensityRanged(keys=["image"], a_min=-98.0, a_max=649.0,
+                                 b_min=-98.0, b_max=649.0, clip=True),
+            NormalizeIntensityd(keys=["image"], subtrahend=253.552, divisor=150.001),
+        ]
+    else:
+        transform_list.append(
+            ScaleIntensityRanged(keys=["image"], a_min=-1000.0, a_max=1000.0, b_min=0.0, b_max=1.0, clip=True)
+        )
+    transform_list.append(EnsureTyped(keys=["image"]))
     transforms = Compose(transform_list)
     ds = Dataset([{"image": f["image_path"], "case_id": f["case_id"]} for f in files], transform=transforms)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
@@ -264,7 +291,47 @@ def run_task1(input_root: Path, output_root: Path) -> None:
             if tuple(probs.shape[2:]) != out_shape:
                 probs = F.interpolate(probs.float(), size=out_shape, mode="trilinear", align_corners=False)
             pred_mask = torch.argmax(probs, dim=1).squeeze(0).detach().cpu().numpy()
-            pred_mask = drop_small_components_3d((pred_mask > 0).astype(np.uint8))
+            pred_mask = (pred_mask > 0).astype(np.uint8)
+
+            # NEVER emit an empty Task 1 mask.
+            #
+            # The organizers' Evaluation page states that "missing or invalid
+            # predictions receive penalty metrics: DSC = 0, HD = large penalty,
+            # ASD = large penalty", and the penalty is 1,000,000 per case (the
+            # fully-failed leaderboard entries read exactly 1000000.0).
+            #
+            # Our v6 submission scored Task1 HD = 28577.43 / ASD = 28572.01.
+            # With 70 hidden test cases that is exactly 2 penalised cases:
+            #   (2 * 1e6 + 68 * ~6) / 70 = 28577.3  -> matches to the decimal.
+            # So two cases produced an empty/invalid mask and each cost 1e6.
+            # A single empty case is worth more damage than every other
+            # accuracy improvement in this pipeline combined.
+            #
+            # Every Task 1 case genuinely contains valve anatomy (verified: min
+            # foreground fraction 1.19% across all 27 labeled cases), so an
+            # empty prediction is always wrong. If argmax produced nothing,
+            # fall back to progressively lower probability thresholds, and as a
+            # last resort keep the single most-confident voxel cluster.
+            if pred_mask.sum() == 0:
+                fg_prob = probs[0, 1].detach().cpu().numpy() if probs.shape[1] > 1 else probs[0, 0].detach().cpu().numpy()
+                for thr in (0.4, 0.3, 0.2, 0.1, 0.05, 0.02):
+                    cand = (fg_prob >= thr).astype(np.uint8)
+                    if cand.sum() > 0:
+                        pred_mask = cand
+                        log(f"task1: EMPTY argmax mask recovered at threshold {thr} ({int(cand.sum())} voxels)")
+                        break
+                if pred_mask.sum() == 0:
+                    # Absolute last resort: take the top-N most confident voxels
+                    # so the case is never scored as a missing prediction.
+                    flat = fg_prob.ravel()
+                    n_keep = max(1, int(0.001 * flat.size))
+                    idx_top = np.argpartition(flat, -n_keep)[-n_keep:]
+                    cand = np.zeros_like(flat, dtype=np.uint8)
+                    cand[idx_top] = 1
+                    pred_mask = cand.reshape(fg_prob.shape)
+                    log(f"task1: EMPTY mask, fell back to top-{n_keep} confident voxels")
+
+            pred_mask = drop_small_components_3d(pred_mask)
 
             save_path = out_dir / f"{case_id}-pred.nii.gz"
             out_header = source_img.header.copy()
@@ -474,8 +541,33 @@ def run_task3(input_root: Path, output_root: Path) -> None:
             # boundary to the coarse grid before the ~3x upsample.
             probs = predict_probs(image_t)
             probs_orig = F.interpolate(probs.float(), size=(h, w), mode="bilinear", align_corners=False)
-            pred_mask = (probs_orig[0, 0].detach().cpu().numpy() > threshold).astype(np.uint8)
+            prob_np = probs_orig[0, 0].detach().cpu().numpy()
+            pred_mask = (prob_np > threshold).astype(np.uint8)
             pred_mask = drop_small_components(pred_mask)
+
+            # Frame-level confidence gate.
+            #
+            # ~34% of Task 3 frames contain no visible valve. The organizers
+            # score empty-prediction-vs-empty-reference as a PERFECT match
+            # (DSC 1, HD 0, ASD 0), but a non-empty prediction on an empty
+            # reference is a failure - and HD/ASD are two thirds of the task's
+            # normalized ranking score. So a false positive on a background
+            # frame is far more expensive than a slightly imperfect mask.
+            #
+            # This gate is deliberately separate from `threshold`: lowering the
+            # pixel threshold reshapes every mask and costs DSC/HD, whereas
+            # this only decides whether the frame gets a prediction AT ALL,
+            # leaving kept masks untouched.
+            #
+            # Measured on the held-out video (30 frames, 19 fg / 11 bg):
+            #   no gate      DSC 0.8018 HD 95.09 ASD 19.31  FP 2/11  FN 0/19
+            #   peak >= 0.6  DSC 0.8018 HD 95.09 ASD 19.31  FP 0/11  FN 0/19
+            # Every false positive disappears at zero cost, because true
+            # detections are confident (peak still > 0.95) while the false
+            # ones are weak. 0.60 sits well inside that separation.
+            if pred_mask.sum() > 0:
+                if float(prob_np[pred_mask > 0].max()) < TASK3_FRAME_CONF_GATE:
+                    pred_mask = np.zeros_like(pred_mask)
 
             save_path = out_dir / rel.parent / f"{image_path.stem}_label_bin.png"
             save_path.parent.mkdir(parents=True, exist_ok=True)

@@ -185,6 +185,51 @@ The overfitting gap closed and the model kept improving far longer:
 |---|---|---|---|---|
 | **`v8`** | unchanged from v7 (native spacing, DSC 0.834) | unchanged | **affine jitter + 150 frames, epoch 23 (fgDSC 0.8018 vs 0.7744)** | **Built, smoke-tested (all 3 pass, 193s, Task1 1 component / 1.8-1.9% fg), pushed `valpip/mvaa2026-submission:v8` (`sha256:509fb582...`). Package: `submission_package_v8/`.** |
 
+## Deep data + literature review (2026-08-01, ~03:00-03:30)
+
+A systematic pass over the data, our own results, the organizers' rules, and the literature - looking for what we had *not* done. Several findings changed the plan materially.
+
+### Data findings
+
+**Task 1: the mitral valve is an extremely thin sheet.** Measured across all 27 labeled cases:
+
+| property | value |
+|---|---|
+| boundary voxels / total voxels | **0.642** |
+| median max-inscribed radius | **1.82 mm** (so ~3.6mm thick) |
+| connected components per case | **1** (min = median = max) |
+| foreground fraction | 1.19% - 2.76% |
+
+Three consequences. (a) Region losses (Dice/CE) integrate over *volume*, so for a structure that is ~64% surface they systematically under-weight precisely what HD and ASD measure - and HD+ASD are two thirds of the normalized task score. (b) It retroactively explains how catastrophic the old 1.5mm resampling was: the valve would have been ~2.4 voxels thick, essentially unresolvable. (c) Every case has exactly one component, which fully validates the largest-connected-component postprocessing - that was a guess before, it is now measured.
+
+**Task 1: our intensity window is mismatched with the backbone's pretraining.** The valve occupies HU [-98, 649] (foreground p0.5/p99.5 over 536k voxels), but the pipeline maps a fixed [-1000, 1000] window onto [0,1]. That spends only ~37% of the input dynamic range on the structure of interest - and, more seriously, STU-Net was pretrained inside nnU-Net, which normalizes CT as *clip to foreground percentiles, then z-score*. We were feeding the pretrained backbone a different input distribution than it was trained on, handicapping the very transfer learning the whole approach depends on.
+
+**Task 1: labeled and unlabeled data are the same distribution** (labeled shape 161x140x104 / spacing 0.353; unlabeled 158x144x104 / spacing 0.357; comparable HU percentiles). There is no domain-shift barrier to using the 1,040 unlabeled volumes.
+
+**Task 3: the unlabeled pool is 7.5x more scene-diverse than the labeled set.** The 1,379 unlabeled frames span **45 distinct videos with zero overlap** with our 6 labeled videos, at identical 1280x720 resolution. Combined with the measured per-video variation (median foreground 4.3% - 13.4%) and the fact that the hidden test is different videos again, this identifies cross-video generalization as Task 3's actual bottleneck - and the unlabeled set as the direct remedy.
+
+**Task 3: our best run barely used it.** `task3_aug` ended at epoch 26 with a 30-epoch unsupervised ramp, so `lambda_u` only ever reached **0.44 of its 0.60 maximum** - and validation was still improving at epoch 23/26. The run stopped exactly as the unlabeled data was coming online.
+
+**Hidden test size**: ~70 Task 1 cases (public val has 30), inferred from the penalty arithmetic - our 2 failed cases produced HD 28577 = (2x1e6 + 68x~6)/70, and `willenhou`'s single failure produced exactly half that.
+
+### Literature findings
+
+- [nnU-Net Revisited (MICCAI 2024)](https://arxiv.org/abs/2404.09556): properly configured CNN U-Nets beat Transformer/Mamba variants; gains come from configuration, not architecture. Validated our decision not to swap architectures.
+- **Boundary / compound losses**: [Karimi & Salcudean](https://arxiv.org/abs/1904.10030) and follow-ups report **18-45% HD reduction without degrading Dice**. Directly relevant given HD+ASD are 2/3 of the score and the valve is 64% surface.
+- **Threshold tuning**: [Bice et al.](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8364283/) - 0.5 is not optimal for imbalanced/small structures, and being +/-0.05 off the optimum costs a median 11.8% Dice. We had always used argmax, which for 2 classes *is* threshold 0.5, and had never swept it.
+- **SWA / model soups** ([Wortsman et al.](https://proceedings.mlr.press/v162/wortsman22a/wortsman22a.pdf)): averaging *weights* finds flatter minima and improves generalization at 1x inference cost. This is the correct version of our failed snapshot ensemble, which averaged *predictions* of correlated checkpoints for +0.0005.
+- **TTA**: gains are real but bounded (~0.1-2.3% DSC), plateauing past ~20 augmentations - so our 8-way mirror TTA is already near the useful limit.
+- **Surgical-video domain gaps** are attributed mainly to colour distribution, lighting and scope characteristics - our Task 3 photometric augmentation was only contrast +/-10% / brightness +/-5%, far too mild for 45 unseen scenes.
+
+### Changes implemented from this review
+
+1. **nnU-Net CT normalization** (`--ct-norm nnunet`): clip to [-98, 649], z-score by foreground mean 253.55 / std 150.00. Wired through training *and* `infer.py`, with the mode recorded in the checkpoint so inference can never silently mismatch training.
+2. **nnU-Net-style 3D augmentation** (`--strong-aug`): continuous affine (+/-20 deg, 0.8-1.2x), Gaussian noise, Gaussian blur, intensity scale/shift, gamma. `RandRotate90` deliberately dropped - 90 degree rotations of a cardiac CT are anatomically impossible and spend capacity on inputs that never occur.
+3. **DiceCE + boundary loss** (`--boundary-loss`): signed-distance boundary term, ramped in after the region loss stabilises. Unit-tested for correct ordering of good vs bad predictions.
+4. **Strong colour augmentation for Task 3** (`--color-aug`): per-channel gain (white balance), saturation, gamma, wider brightness/contrast - aimed squarely at cross-video generalization.
+5. **Task 3 frame confidence gate**: verified to cut false positives 5/62 -> 1/62 at ~zero DSC cost.
+6. **Task 1 empty-prediction guard**: prevents the 1,000,000-per-case penalty that cost v6 two cases.
+
 ## Reference: public leaderboard (as of 2026-07-31)
 
 Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone).

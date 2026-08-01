@@ -130,6 +130,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation split ratio from labeled train set")
     parser.add_argument("--val-count", type=int, default=0, help="Override val size from labeled train set")
     parser.add_argument("--split-seed", type=int, default=42, help="Random seed for train/val split")
+    parser.add_argument("--ct-norm", type=str, default="window", choices=["window", "nnunet"],
+                        help="CT intensity normalization: legacy fixed window, or nnU-Net foreground clip + z-score (matches STU-Net pretraining)")
+    parser.add_argument("--boundary-loss", action="store_true",
+                        help="Add a surface-distance boundary term to DiceCE (targets HD/ASD on thin structures)")
+    parser.add_argument("--strong-aug", action="store_true",
+                        help="nnU-Net-style 3D augmentation: continuous affine, noise, blur, intensity, gamma")
     parser.add_argument("--log-name", type=str, default="train.log", help="Training log file name")
 
     return parser.parse_args()
@@ -386,6 +392,8 @@ def main() -> int:
         val_ratio=args.val_ratio,
         val_count=args.val_count,
         split_seed=args.split_seed,
+        strong_aug=bool(getattr(args, "strong_aug", False)),
+        ct_norm=str(getattr(args, "ct_norm", "window")),
     )
 
     student = get_model(
@@ -405,7 +413,7 @@ def main() -> int:
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    sup_loss_fn = get_supervised_loss_fn()
+    sup_loss_fn = get_supervised_loss_fn(boundary=bool(getattr(args, 'boundary_loss', False)))
     unsup_loss_fn = get_unsupervised_loss_fn()
 
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -473,6 +481,15 @@ def main() -> int:
     start = time.time()
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
+        # Ramp the boundary term in after the region loss has established a
+        # sensible prediction. The signed-distance term is unstable when the
+        # network still outputs near-random probabilities, so the standard
+        # recipe is region-loss-first then blend. Linear 0 -> 1 over the first
+        # half of training, held at 1 afterwards.
+        if hasattr(sup_loss_fn, "alpha"):
+            warm = max(1, int(0.15 * args.epochs))
+            full = max(warm + 1, int(0.50 * args.epochs))
+            sup_loss_fn.alpha = 0.0 if epoch <= warm else min(1.0, (epoch - warm) / (full - warm))
         if epoch <= args.unsup_warmup_epochs:
             unsup_weight = 0.0
         else:

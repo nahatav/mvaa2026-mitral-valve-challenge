@@ -15,9 +15,16 @@ from monai.transforms import (
     EnsureChannelFirstd,
     EnsureTyped,
     LoadImaged,
+    NormalizeIntensityd,
+    RandAdjustContrastd,
+    RandAffined,
     RandCropByPosNegLabeld,
     RandFlipd,
+    RandGaussianNoised,
+    RandGaussianSmoothd,
     RandRotate90d,
+    RandScaleIntensityd,
+    RandShiftIntensityd,
     RandSpatialCropSamplesd,
     ResizeWithPadOrCropd,
     ScaleIntensityRanged,
@@ -26,6 +33,53 @@ from monai.transforms import (
 )
 
 _AFFINE_EPS = 1e-8
+
+# --------------------------------------------------------------------------
+# CT intensity normalization
+#
+# The baseline maps a fixed [-1000, 1000] HU window onto [0, 1]. Measured on
+# all 27 labeled cases, the mitral valve's own intensity distribution is
+# p0.5 = -98 HU, p99.5 = 649 HU - so that window spends only ~37% of the
+# network's input dynamic range on the structure we care about.
+#
+# More importantly, our backbone is STU-Net pretrained inside nnU-Net, which
+# normalizes CT as: clip to the dataset's foreground [p0.5, p99.5], then
+# z-score by the foreground mean/std. Feeding it a [0,1] windowed image is a
+# DIFFERENT input distribution than it was pretrained on, which handicaps
+# exactly the transfer learning we depend on. Matching the scheme fixes the
+# dynamic-range waste and the pretraining mismatch at the same time.
+#
+# Constants below are computed from this dataset's own foreground voxels
+# (536,291 samples across all 27 labeled cases).
+CT_NNUNET_CLIP_LO = -98.0
+CT_NNUNET_CLIP_HI = 649.0
+CT_NNUNET_MEAN = 253.552
+CT_NNUNET_STD = 150.001
+
+
+def ct_intensity_transforms(ct_norm: str, keys=("image",)):
+    """Intensity normalization for Task 1 CT.
+
+    ct_norm="window"  -> legacy fixed [-1000,1000] -> [0,1] mapping
+    ct_norm="nnunet"  -> clip to foreground [p0.5,p99.5] then z-score,
+                         matching how the STU-Net backbone was pretrained.
+    """
+    keys = list(keys)
+    if ct_norm == "nnunet":
+        return [
+            ScaleIntensityRanged(
+                keys=keys,
+                a_min=CT_NNUNET_CLIP_LO, a_max=CT_NNUNET_CLIP_HI,
+                b_min=CT_NNUNET_CLIP_LO, b_max=CT_NNUNET_CLIP_HI,
+                clip=True,
+            ),
+            NormalizeIntensityd(keys=keys, subtrahend=CT_NNUNET_MEAN, divisor=CT_NNUNET_STD),
+        ]
+    return [
+        ScaleIntensityRanged(
+            keys=keys, a_min=-1000.0, a_max=1000.0, b_min=0.0, b_max=1.0, clip=True,
+        )
+    ]
 
 
 def _to_numpy_affine(affine) -> np.ndarray | None:
@@ -123,6 +177,8 @@ def get_labeled_train_transforms(
     num_samples: int,
     enable_spacing_resample: bool = False,
     target_spacing: Sequence[float] = (0.5, 0.5, 0.5),
+    strong_aug: bool = False,
+    ct_norm: str = "window",
 ):
     transforms = [
         LoadImaged(keys=["image", "label"]),
@@ -140,14 +196,7 @@ def get_labeled_train_transforms(
         )
     transforms.extend(
         [
-            ScaleIntensityRanged(
-                keys=["image"],
-                a_min=-1000.0,
-                a_max=1000.0,
-                b_min=0.0,
-                b_max=1.0,
-                clip=True,
-            ),
+            *ct_intensity_transforms(ct_norm),
             SpatialPadd(keys=["image", "label"], spatial_size=tuple(roi_size)),
             RandCropByPosNegLabeld(
                 keys=["image", "label"],
@@ -164,10 +213,48 @@ def get_labeled_train_transforms(
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
-            RandRotate90d(keys=["image", "label"], prob=0.2, max_k=3),
-            EnsureTyped(keys=["image", "label"]),
         ]
     )
+
+    if strong_aug:
+        # nnU-Net-style 3D augmentation.
+        #
+        # The original pipeline had ONLY axis flips and RandRotate90 - both of
+        # which map the voxel grid onto itself, so they generate no genuinely
+        # new geometry. That is the same weakness that was throttling Task 3,
+        # where adding continuous affine jitter was worth +0.084 real DSC on
+        # the hidden test. With 19-27 labeled volumes this is the dominant
+        # regularisation lever available.
+        #
+        # RandRotate90 is deliberately DROPPED here rather than kept: a 90
+        # degree rotation of a cardiac CT produces anatomically impossible
+        # orientations that never occur at test time, so it spends model
+        # capacity on garbage. Continuous small-angle rotation is the correct
+        # analogue and is what nnU-Net actually uses.
+        transforms.extend(
+            [
+                RandAffined(
+                    keys=["image", "label"],
+                    prob=0.5,
+                    rotate_range=(0.35, 0.35, 0.35),   # ~ +/-20 degrees per axis
+                    scale_range=(0.20, 0.20, 0.20),    # 0.8x - 1.2x
+                    mode=("bilinear", "nearest"),      # nearest keeps labels discrete
+                    padding_mode="border",
+                ),
+                RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.02),
+                RandGaussianSmoothd(
+                    keys=["image"], prob=0.15,
+                    sigma_x=(0.5, 1.0), sigma_y=(0.5, 1.0), sigma_z=(0.5, 1.0),
+                ),
+                RandScaleIntensityd(keys=["image"], prob=0.25, factors=0.25),
+                RandShiftIntensityd(keys=["image"], prob=0.25, offsets=0.10),
+                RandAdjustContrastd(keys=["image"], prob=0.25, gamma=(0.7, 1.5)),
+            ]
+        )
+    else:
+        transforms.append(RandRotate90d(keys=["image", "label"], prob=0.2, max_k=3))
+
+    transforms.append(EnsureTyped(keys=["image", "label"]))
     return Compose(transforms)
 
 
@@ -176,6 +263,7 @@ def get_unlabeled_train_transforms(
     num_samples: int,
     enable_spacing_resample: bool = False,
     target_spacing: Sequence[float] = (0.5, 0.5, 0.5),
+    ct_norm: str = "window",
 ):
     transforms = [
         LoadImaged(keys=["image"]),
@@ -193,14 +281,7 @@ def get_unlabeled_train_transforms(
         )
     transforms.extend(
         [
-            ScaleIntensityRanged(
-                keys=["image"],
-                a_min=-1000.0,
-                a_max=1000.0,
-                b_min=0.0,
-                b_max=1.0,
-                clip=True,
-            ),
+            *ct_intensity_transforms(ct_norm),
             SpatialPadd(keys=["image"], spatial_size=tuple(roi_size)),
             RandSpatialCropSamplesd(
                 keys=["image"],
@@ -223,6 +304,7 @@ def get_unlabeled_train_transforms(
 def get_eval_transforms(
     enable_spacing_resample: bool = False,
     target_spacing: Sequence[float] = (0.5, 0.5, 0.5),
+    ct_norm: str = "window",
 ):
     transforms = [
         LoadImaged(keys=["image", "label"]),
@@ -240,14 +322,7 @@ def get_eval_transforms(
         )
     transforms.extend(
         [
-            ScaleIntensityRanged(
-                keys=["image"],
-                a_min=-1000.0,
-                a_max=1000.0,
-                b_min=0.0,
-                b_max=1.0,
-                clip=True,
-            ),
+            *ct_intensity_transforms(ct_norm),
             EnsureTyped(keys=["image", "label"]),
         ]
     )
@@ -268,6 +343,8 @@ def get_task1_dataloaders(
     val_ratio: float = 0.1,
     val_count: int = 0,
     split_seed: int = 42,
+    strong_aug: bool = False,
+    ct_norm: str = "window",
 ):
     root = Path(root_dir)
 
@@ -321,6 +398,8 @@ def get_task1_dataloaders(
             num_samples=num_samples,
             enable_spacing_resample=enable_spacing_resample,
             target_spacing=target_spacing,
+            strong_aug=strong_aug,
+            ct_norm=ct_norm,
         ),
         cache_rate=1.0,
         num_workers=0,
@@ -333,6 +412,7 @@ def get_task1_dataloaders(
             num_samples=num_samples,
             enable_spacing_resample=enable_spacing_resample,
             target_spacing=target_spacing,
+            ct_norm=ct_norm,
         ),
     )
     val_ds = Dataset(
@@ -340,6 +420,7 @@ def get_task1_dataloaders(
         transform=get_eval_transforms(
             enable_spacing_resample=enable_spacing_resample,
             target_spacing=target_spacing,
+            ct_norm=ct_norm,
         ),
     )
     labeled_loader = DataLoader(

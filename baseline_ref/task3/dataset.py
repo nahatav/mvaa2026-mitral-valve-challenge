@@ -269,6 +269,45 @@ def _affine_jitter(
     return img.squeeze(0), msk.squeeze(0)
 
 
+def _color_jitter_strong(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    """Aggressive photometric augmentation for cross-VIDEO generalisation.
+
+    Task 3's real bottleneck is generalising to surgical scenes we have never
+    seen: we have only 6 labeled videos, while the unlabeled pool spans 45
+    distinct videos and the hidden test is different videos again. Measured
+    per-video median foreground varies 4.3%-13.4%, and the surgical-video
+    literature attributes cross-domain failure mainly to variation in colour
+    distribution, lighting and camera/scope characteristics.
+
+    The existing `_photo_aug_weak` only perturbs contrast +/-10% and
+    brightness +/-5%, which is far too mild to simulate a different scope or
+    light source. This adds per-channel gain (white balance), saturation,
+    gamma and wider brightness/contrast.
+
+    img: HWC RGB float in [0,1].
+    """
+    out = img
+    # per-channel gain ~ white balance / scope colour response
+    if rng.random() < 0.8:
+        gains = np.array([1.0 + rng.uniform(-0.18, 0.18) for _ in range(3)], dtype=np.float32)
+        out = np.clip(out * gains[None, None, :], 0.0, 1.0)
+    # saturation
+    if rng.random() < 0.5:
+        gray = out.mean(axis=2, keepdims=True)
+        sat = 1.0 + rng.uniform(-0.35, 0.35)
+        out = np.clip(gray + (out - gray) * sat, 0.0, 1.0)
+    # brightness / contrast, wider than the weak version
+    if rng.random() < 0.8:
+        contrast = 1.0 + rng.uniform(-0.25, 0.25)
+        brightness = rng.uniform(-0.12, 0.12)
+        out = np.clip((out - 0.5) * contrast + 0.5 + brightness, 0.0, 1.0)
+    # gamma
+    if rng.random() < 0.5:
+        gamma = float(np.exp(rng.uniform(np.log(0.7), np.log(1.45))))
+        out = np.clip(np.power(np.clip(out, 1e-6, 1.0), gamma), 0.0, 1.0)
+    return out.astype(np.float32)
+
+
 def _photo_aug_weak(img: np.ndarray, rng: random.Random) -> np.ndarray:
     if rng.random() < 0.5:
         contrast = 1.0 + rng.uniform(-0.10, 0.10)
@@ -313,12 +352,14 @@ class LabeledDataset(torch.utils.data.Dataset):
         use_imagenet_norm: bool,
         seed: int,
         affine_prob: float = 0.0,
+        color_aug: bool = False,
     ) -> None:
         self.samples = list(samples)
         self.image_size = image_size
         self.target_label = int(target_label)
         self.train = bool(train)
         self.affine_prob = float(affine_prob)
+        self.color_aug = bool(color_aug)
         self.cache_masks = bool(cache_masks)
         self.use_imagenet_norm = bool(use_imagenet_norm)
         self.rng = random.Random(seed)
@@ -356,7 +397,10 @@ class LabeledDataset(torch.utils.data.Dataset):
             rot_k = self.rng.randint(0, 3) if self.rng.random() < 0.4 else 0
             image = _apply_geom(image, hflip=hflip, vflip=vflip, rot_k=rot_k)
             mask = _apply_geom(mask[..., None], hflip=hflip, vflip=vflip, rot_k=rot_k)[..., 0]
-            image = _photo_aug_weak(image, self.rng)
+            if self.color_aug:
+                image = _color_jitter_strong(image, self.rng)
+            else:
+                image = _photo_aug_weak(image, self.rng)
             if self.rng.random() < 0.2:
                 noise = np.random.normal(0.0, 0.02, size=image.shape).astype(np.float32)
                 image = np.clip(image + noise, 0.0, 1.0)
