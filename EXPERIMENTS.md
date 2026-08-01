@@ -265,6 +265,26 @@ This gives the strong colour augmentation a concrete mechanism rather than a vag
 
 We have used exactly one backbone all project (STU-Net-B, supervised-pretrained on TotalSegmentator-derived labels) and never evaluated alternatives. Reviewed [SuPreM](https://github.com/MrGiovanni/SuPreM) (ICLR 2024 oral, 9,262 CT volumes) and [VoCo](https://hkustsmartlab.github.io/2025/12/03/voco/) (self-supervised, 160K CT volumes). Two conclusions: supervised pretraining is reported as the preferred choice for transfer, so our backbone is already the right *class* of model - swapping is unlikely to be the win; and VoCo's documented strength is precisely "datasets with limited labeled cases", which is our regime, but a backbone swap mid-run is high integration risk for unproven gain. Recorded as a genuine option for a longer budget, not taken now.
 
+## Task 1 SOTA run: RESULT - all three metrics improved (2026-08-01, 05:28)
+
+A/B on the same 8 held-out cases, scored in original image space through the identical pipeline:
+
+| model | DSC | HD | ASD |
+|---|---|---|---|
+| production (fixed window, flips+rot90 only, DiceCE) | 0.8341 | 4.477 | 0.2980 |
+| **new (nnU-Net norm + strong aug + boundary loss)** | **0.8435** | **4.126** | **0.2751** |
+| delta | **+0.0094** | **-7.8%** | **-7.7%** |
+
+All three moved the right way. The HD/ASD gains are specifically what the boundary term was added for, on a structure that is 64% surface voxels - so the mechanism behaved as predicted rather than by accident.
+
+**This is an undertrained result.** The run crashed at epoch 250 of 320 when the disk hit 100% mid-checkpoint-write.
+
+**Root cause of the crash was my own instrumentation.** The SWA snapshotter I added writes 930MB files, alongside the 930MB per-epoch `latest_model.pt`, on a drive that was already down to ~4.7GB. Two lessons, both self-inflicted:
+- Instrumentation has to be budgeted like a real resource. I checked GPU memory before every training decision and never checked disk before adding a snapshot mechanism that writes ~1GB per snapshot.
+- The same mechanism is also what rescued the run: `swa_250.pt` was complete and verified, while `latest_model.pt` was truncated and unreadable. Verifying each snapshot at write time (rather than assuming a successful `cp`) is what made it trustworthy - that check was added earlier in the session after a truncated copy went unnoticed.
+
+Recovery: deleted superseded/failed/killed-early run directories (`task1_v5fix`, `task1_native_f1/f2`, `task1_nat`, `task1_aug`, `task1_fold2`, `task3_hires`) and non-best Task 3 checkpoints, taking free space from 0 to 9.7GB. Task 3 relaunched with `--save-every 200` so it cannot repeat the exhaustion.
+
 ## Reference: public leaderboard (as of 2026-07-31)
 
 Only Task 1 and Task 3 affect ranking (Task 2 is normalized to 100 for everyone).
